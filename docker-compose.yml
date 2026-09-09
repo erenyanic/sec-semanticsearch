@@ -6,9 +6,15 @@
 #   docker compose up -d              # detached mode
 #   docker compose down -v            # stop and remove volumes (reset)
 #
-# GPU support (NVIDIA):
-#   Uncomment the `deploy` section under the `api` service.
-#   Requires: nvidia-container-toolkit installed on the host.
+# GPU support (NVIDIA) — enabled by default:
+#   The `api` service reserves an NVIDIA device and EMBEDDING_DEVICE
+#   defaults to `cuda`. Requires nvidia-container-toolkit on the host,
+#   plus an image built against a CUDA wheel:
+#     docker compose build \
+#       --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 api
+#   To run on CPU, comment out the `deploy` block under `api` and set
+#   EMBEDDING_DEVICE=cpu. Only `auto` falls back on its own; an explicit
+#   `cuda` is passed straight to the model loader.
 #
 # TLS:
 #   Mount certificates in the nginx service and uncomment the TLS
