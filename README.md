@@ -15,35 +15,33 @@ This is a **vector similarity search** system — not RAG. No language model gen
   </tr>
 </table>
 
-Filing content is fetched from SEC EDGAR, parsed into structured sections, split into 500-token chunks at sentence boundaries, and encoded as 768-dimensional vectors by a local sentence-transformer model. Vectors are stored in ChromaDB alongside a SQLite metadata registry that handles duplicate detection and filing management. At search time, the query is embedded with the same model and the most semantically similar chunks are retrieved — results are always direct excerpts from the original filings, never generated text.
+Filing content is fetched from SEC EDGAR, parsed into structured sections, split into 500-token chunks at sentence boundaries, and encoded as 768-dimensional vectors by a local sentence-transformer model. Vectors are stored in ChromaDB alongside a SQLite metadata registry that handles duplicate detection and filing management. At search time, the query is embedded with the same model and the most semantically similar chunks are retrieved. What is embedded is not what is displayed: each chunk is resolved back to the parent segment it came from, so a result shows the surrounding passage with the matched chunk highlighted inside it. Results are always direct excerpts from the original filings, never generated text.
 
 ---
 
 ## Features
 
 - **Full pipeline** — Fetch, parse, chunk, embed, and store SEC filings in one command
-- **GPU-accelerated embeddings** — Uses `google/embeddinggemma-300m` (768-dim) via sentence-transformers with CUDA support; BF16 quantisation applied automatically on CUDA devices
+- **GPU-accelerated embeddings** — Uses `google/embeddinggemma-300m` (768-dim) via sentence-transformers with CUDA support; BF16 quantization applied automatically on CUDA devices
 - **Dual-store architecture** — ChromaDB for vector search, SQLite for relational metadata
+- **Parent-context resolution** — The short embedded chunk is matched, but the full parent segment is displayed with the chunk highlighted, in both the CLI and the web UI
 - **Web application** — FastAPI backend + React/Next.js frontend with real-time WebSocket progress
 - **Rich CLI** — Progress bars, colour-coded similarity output, formatted tables, contextual error hints
-- **Privacy by design** — Search queries are never persisted; per-session EDGAR credentials are never stored server-side
+- **No query or credential storage** — Search queries are embedded in memory, used for retrieval, then discarded; no table or file records them. Per-session EDGAR credentials are never stored server-side
 - **Encryption at rest** — Optional SQLCipher encryption for the SQLite metadata database
 - **Two-tier access control** — Separate API key and admin key; admin key never exposed in browser code
 - **Demo mode** — FIFO eviction when the filing limit is reached; nightly reset notice in the UI
 - **Flexible filtering** — Search and manage by ticker, form type, or date range
 - **Duplicate detection** — Checks for existing filings before any GPU work begins
 - **Configuration-driven deployment** — Three deployment scenarios (local, team, public) controlled entirely via environment variables
-- **1099 backend tests and 199 frontend tests**, all passing
 
 ---
 
-## Embedding Model & Quantisation
+## Embedding model & quantization
 
-The system uses `google/embeddinggemma-300m`, a 768-dimensional sentence-transformer model, for all vector encoding. On CUDA devices, BF16 quantisation is applied automatically at model load time — no configuration required.
+The system uses `google/embeddinggemma-300m`, a 768-dimensional sentence-transformer model, for all vector encoding. On CUDA devices, BF16 quantization is applied automatically at model load time — no configuration required.
 
-BF16 was selected after measuring the trade-off between VRAM reduction and embedding quality. Whilst the theoretical VRAM reduction from FP32 → BF16 is 50%, practical measurement in the production deployment of this system achieved **27.12% savings** due to model architecture overhead, CUDA runtime buffers, and ChromaDB memory usage sharing the same GPU. Performance degradation remained below **0.0001 in cosine similarity**, effectively preserving search quality without detectable information loss.
-
-> For the full investigation — including quantisation experiments comparing FP32, BF16, INT8, and INT4 — see the [quantization notebook in the *Today I Learned* repository](https://github.com/ErenYanic/til/tree/main/quantization).
+BF16 was selected after measuring the trade-off between VRAM use and embedding quality. The theoretical FP32 → BF16 reduction of 50% applies to the model weights alone; measured across a full ingest run of this project, GPU memory use fell by **27.12%**, since the weights are only part of the total allocation. Embedding quality was compared over a 30-document benchmark of filing excerpts: mean cosine similarity between the FP32 and BF16 embeddings was **0.9999** (minimum 0.9997), and the top-5 rankings were identical.
 
 ---
 
@@ -102,7 +100,7 @@ The SEC requires a name and email in the User-Agent header of every EDGAR reques
 | `EDGAR_IDENTITY_NAME`  | Your name (SEC EDGAR identification) |
 | `EDGAR_IDENTITY_EMAIL` | Your email address                   |
 
-> For web deployments with `EDGAR_SESSION_REQUIRED=true`, these can remain unset — the frontend shows a session-start form where each user provides their own credentials.
+> For web deployments with `API_EDGAR_SESSION_REQUIRED=true`, these can remain unset — the frontend shows a session-start form where each user provides their own credentials.
 
 **Commonly used optional variables:**
 
@@ -118,9 +116,9 @@ The SEC requires a name and email in the User-Agent header of every EDGAR reques
 | `DB_MAX_FILINGS`       | `2500`                       | Maximum filings to store                          |
 | `SEARCH_TOP_K`         | `5`                          | Default number of search results                  |
 | `API_KEY`              | unset                        | General API access key; unset = no authentication |
-| `ADMIN_API_KEY`        | unset                        | Admin key for destructive operations              |
+| `API_ADMIN_KEY`        | unset                        | Admin key for destructive operations              |
 | `LOG_REDACT_QUERIES`   | `false`                      | Hash search queries and tickers in logs           |
-| `DEMO_MODE`            | `false`                      | FIFO eviction + nightly-reset notice              |
+| `API_DEMO_MODE`        | `false`                      | FIFO eviction + nightly-reset notice              |
 
 See [`.env.example`](.env.example) for the full variable list with descriptions.
 
@@ -349,7 +347,7 @@ The frontend runs on `http://localhost:3000` and proxies API requests to `http:/
 - **Ingest** — Tag-style ticker input, form type selection, real-time WebSocket progress per filing, cancel support, active-task recovery on page load
 - **Filings** — Sortable and filterable table, pagination, multi-select, individual and bulk delete, URL-based filter persistence
 
-Additional: dark/light theme, CSS-only loading skeletons, skip-to-content, keyboard navigation, ARIA attributes, custom 404 and error boundary pages.
+The interface also provides a dark/light theme, CSS-only loading skeletons, skip-to-content and keyboard navigation, ARIA attributes, and custom 404 and error boundary pages.
 
 ### API endpoints
 
@@ -394,7 +392,7 @@ sec-search-api --ssl-certfile cert.pem --ssl-keyfile key.pem
 **Recommended settings for public deployments:**
 
 - Set `API_KEY` to a strong random value
-- Set `ADMIN_API_KEY` separately for destructive operations
+- Set `API_ADMIN_KEY` separately for destructive operations. When running the web stack, set the frontend's `ADMIN_API_KEY` to the same value — Next.js route handlers read it server-side and forward it to the API as `X-Admin-Key`, so it never reaches browser code
 - Set `DB_ENCRYPTION_KEY` to enable SQLCipher encryption on the SQLite database
 - Set `LOG_REDACT_QUERIES=true` to hash search queries and tickers in logs
 - Set rate limits via `API_RATE_LIMIT_*` environment variables
@@ -423,17 +421,16 @@ docker compose down -v
 
 ### GPU support
 
-The API image uses CPU-only PyTorch by default (~2 GB). For GPU acceleration:
+The Compose stack targets GPU inference: the `api` service reserves an NVIDIA device and `EMBEDDING_DEVICE` defaults to `cuda`. Two host-side steps are required:
 
-1. Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) on the host
-2. Uncomment the `deploy` section under the `api` service in `docker-compose.yml`
-3. Set `EMBEDDING_DEVICE=cuda` in your environment
-
-Or build directly with a CUDA-enabled wheel:
+1. Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) on the host
+2. Build the API image against a CUDA-enabled PyTorch wheel — the default build argument installs the CPU-only wheel (~2 GB image):
 
 ```bash
 docker compose build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 api
 ```
+
+To run on CPU instead, comment out the `deploy` block under the `api` service and set `EMBEDDING_DEVICE=cpu`. Note that only `EMBEDDING_DEVICE=auto` falls back to CPU when no GPU is present — an explicit `cuda` is passed straight to the model loader. Embedding on CPU is considerably slower.
 
 ### TLS
 
@@ -459,9 +456,9 @@ python -m pytest tests/integration/
 python -m pytest tests/api/
 ```
 
-**Backend:** 1099 tests, all passing.
+**Backend:** 1,132 tests.
 
-**Frontend:** 199 tests (Vitest + React Testing Library):
+**Frontend:** 202 tests (Vitest + React Testing Library):
 
 ```bash
 cd frontend
@@ -490,7 +487,7 @@ SEC-SemanticSearch/
 │   └── api/                          # FastAPI backend (routes, schemas, tasks, WebSocket)
 ├── frontend/
 │   ├── src/app/                      # Next.js pages (Dashboard, Search, Ingest, Filings)
-│   ├── src/components/               # 33 UI components
+│   ├── src/components/               # Shared and page-scoped UI components
 │   ├── src/hooks/                    # React Query hooks
 │   └── src/lib/                      # API client, types, WebSocket client
 ├── tests/
@@ -522,28 +519,14 @@ SEC-SemanticSearch/
 
 ---
 
-## Licensing & Usage
+## Licensing & usage
 
-**SEC-SemanticSearch** is licensed under the **Business Source License 1.1 (BSL 1.1)**.
+**SEC-SemanticSearch** is licensed under the **Business Source License 1.1 (BSL 1.1)**. The goal is to keep the code open for developers, students, and researchers to study the semantic search architecture, chunking, and security design, while protecting it against unauthorized commercial exploitation and competing hosted offerings.
 
-Our goal with this license is to keep the codebase open for developers, students, and researchers to explore our semantic search architecture and chunking logic, while protecting the project against unauthorized commercial exploitation and competing SaaS offerings.
+**Free & open** — personal and academic projects, non-commercial research, and temporary internal evaluation (including running the full stack locally to assess fit).
 
-### What you CAN do (Free & Open)
+**Requires a commercial licence** — production deployment in a company's operations or data pipelines, and offering the software to third parties as a hosted service, API, or search platform.
 
-You are completely free to download, modify, and use this project for:
+**Future open-source conversion:** every release automatically transitions to the **Apache License 2.0** four years after its release date.
 
-- **Personal and Academic projects.**
-- **Non-commercial research.**
-- **Temporary Internal Evaluation:** You can set up the project (including ChromaDB, PostgreSQL, Redis, and Celery workers) in a local or isolated sandbox environment to evaluate if it fits your organization's needs.
-
-### What requires a Commercial License
-
-You may not use this software for commercial purposes without an explicit commercial license. This includes:
-
-- **Production Deployment:** Integrating the software into your company's daily operations or active data pipelines.
-- **Managed Services (SaaS):** Offering the software to third parties as a hosted service, API, or search platform.
-
-**Future Open Source Conversion:** 
-In the spirit of the open-source community, every version of this software will automatically transition to the permissive **Apache License 2.0** exactly four years after its specific release date.
-
-For commercial licensing inquiries or production use cases, please contact me directly.
+For commercial licensing enquiries, contact me directly.
