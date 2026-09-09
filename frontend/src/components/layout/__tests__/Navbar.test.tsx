@@ -102,7 +102,7 @@ describe("Navbar — portfolio icons (BF-009)", () => {
       .getByRole("link", { name: "GitHub profile" })
       .closest(".ml-auto");
     expect(rightContainer).not.toBeNull();
-    const themeToggle = within(rightContainer!).getByRole("button", {
+    const themeToggle = within(rightContainer as HTMLElement).getByRole("button", {
       name: /Switch to .* mode/,
     });
     expect(themeToggle).toBeInTheDocument();

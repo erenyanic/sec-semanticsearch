@@ -100,7 +100,7 @@ describe("WelcomeGate", () => {
         ticker_breakdown: [],
         edgar_session_required: false,
       },
-    } as ReturnType<typeof useStatus>);
+    } as unknown as ReturnType<typeof useStatus>);
     mockUseEdgarSession.mockReturnValue(defaultSession);
 
     renderGate();
@@ -120,7 +120,7 @@ describe("WelcomeGate", () => {
         ticker_breakdown: [],
         edgar_session_required: true,
       },
-    } as ReturnType<typeof useStatus>);
+    } as unknown as ReturnType<typeof useStatus>);
     mockUseEdgarSession.mockReturnValue({
       ...defaultSession,
       isAuthenticated: true,
@@ -145,7 +145,7 @@ describe("WelcomeGate", () => {
         ticker_breakdown: [],
         edgar_session_required: true,
       },
-    } as ReturnType<typeof useStatus>);
+    } as unknown as ReturnType<typeof useStatus>);
     mockUseEdgarSession.mockReturnValue(defaultSession);
 
     renderGate();
@@ -170,7 +170,7 @@ describe("WelcomeGate", () => {
         ticker_breakdown: [],
         edgar_session_required: true,
       },
-    } as ReturnType<typeof useStatus>);
+    } as unknown as ReturnType<typeof useStatus>);
     mockUseEdgarSession.mockReturnValue({ ...defaultSession, login: mockLogin });
 
     renderGate();
@@ -201,7 +201,7 @@ describe("WelcomeGate", () => {
         ticker_breakdown: [],
         edgar_session_required: true,
       },
-    } as ReturnType<typeof useStatus>);
+    } as unknown as ReturnType<typeof useStatus>);
     mockUseEdgarSession.mockReturnValue(defaultSession);
 
     renderGate();

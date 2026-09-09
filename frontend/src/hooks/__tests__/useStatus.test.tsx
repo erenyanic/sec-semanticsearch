@@ -1,6 +1,7 @@
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
+import type { StatusResponse } from "@/lib/types";
 import { useStatus } from "../useStatus";
 
 // Mock the API module at the boundary — not axios, not the network
@@ -27,13 +28,16 @@ describe("useStatus", () => {
   });
 
   it("returns data on success", async () => {
-    const mockData = {
+    const mockData: StatusResponse = {
       filing_count: 5,
       max_filings: 200,
       chunk_count: 1500,
       tickers: ["AAPL"],
       form_breakdown: { "10-K": 3, "10-Q": 2 },
       ticker_breakdown: [],
+      edgar_session_required: false,
+      demo_mode: false,
+      is_admin: true,
     };
     mockGetStatus.mockResolvedValue(mockData);
 
