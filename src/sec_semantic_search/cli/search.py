@@ -7,7 +7,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from sec_semantic_search.core import SearchError
+from sec_semantic_search.core import DatabaseError, SearchError
 from sec_semantic_search.search import SearchEngine
 
 console = Console()
@@ -106,6 +106,14 @@ def search(
                 start_date=start_date,
                 end_date=end_date,
             )
+        except DatabaseError as e:
+            console.print(f"[red]Search failed:[/red] {e.message}")
+            console.print(
+                "  [dim italic]Hint: Check that the metadata database is readable. "
+                "If DB_ENCRYPTION_KEY is set, install the encryption extra with "
+                "'pip install sec-semantic-search[encryption]'.[/dim italic]"
+            )
+            raise typer.Exit(code=1) from None
         except SearchError as e:
             console.print(f"[red]Search failed:[/red] {e.message}")
             if e.details:

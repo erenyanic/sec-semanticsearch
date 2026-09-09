@@ -368,14 +368,28 @@ class TestEncryptionKeyEdgeCases:
         """encryption_key=None defers to settings.database.encryption_key.
 
         When DB_ENCRYPTION_KEY is set in .env, passing None still results
-        in an encrypted database.  To explicitly disable encryption
-        regardless of settings, pass encryption_key="".
+        in an encrypted database — but only when pysqlcipher3 can actually
+        be imported.  If the extra is missing, or installed without the
+        libsqlcipher shared library, ``_get_sqlite_module`` warns and falls
+        back to plain sqlite3, so the expectation has to hold in both
+        environments.  To explicitly disable encryption regardless of
+        settings, pass encryption_key="".
         """
         from sec_semantic_search.config import get_settings
 
+        # Probe the same way ``_get_sqlite_module`` does: importlib.find_spec
+        # is not enough, because the package can be installed while its
+        # compiled extension fails to load (missing libsqlcipher).
+        try:
+            from pysqlcipher3 import dbapi2 as _sqlcipher  # noqa: F401
+
+            sqlcipher_usable = True
+        except ImportError:
+            sqlcipher_usable = False
+
         settings_key = get_settings().database.encryption_key
         registry = MetadataRegistry(db_path=tmp_db_path, encryption_key=None)
-        expected_encrypted = bool(settings_key)
+        expected_encrypted = bool(settings_key) and sqlcipher_usable
         assert registry.encrypted is expected_encrypted
         registry.close()
 

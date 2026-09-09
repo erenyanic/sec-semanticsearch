@@ -9,6 +9,7 @@ fast while verifying exit codes, output messages, and command routing.
 import re
 from unittest.mock import MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from sec_semantic_search.cli.main import app
@@ -359,6 +360,18 @@ class TestDeleteFilingsBatch:
 class TestSearchCommand:
     """The search command should display results or 'no results'."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_registry(self):
+        """Keep the search command away from the real metadata database.
+
+        ``cli.search`` builds its own ``MetadataRegistry`` so the engine can
+        resolve parent segments. The import is function-local, so patch the
+        name on ``sec_semantic_search.database`` where it is looked up.
+        """
+        with patch("sec_semantic_search.database.MetadataRegistry") as MockRegistry:
+            MockRegistry.return_value = MagicMock()
+            yield MockRegistry
+
     def test_no_results(self):
         with patch("sec_semantic_search.cli.search.SearchEngine") as MockEngine:
             mock_engine = MagicMock()
@@ -369,6 +382,26 @@ class TestSearchCommand:
 
         assert result.exit_code == 0
         assert "No results found" in result.output
+
+    def test_registry_database_error_is_reported(self, _isolate_registry):
+        """An unreadable metadata database should exit cleanly, not traceback.
+
+        ``MetadataRegistry()`` is constructed inside the search command, so a
+        SQLCipher/permissions failure surfaces there rather than from the
+        engine. Without explicit handling it escaped as an unhandled
+        exception.
+        """
+        from sec_semantic_search.core.exceptions import DatabaseError
+
+        _isolate_registry.side_effect = DatabaseError("file is not a database")
+
+        with patch("sec_semantic_search.cli.search.SearchEngine"):
+            result = runner.invoke(app, ["search", "test query"])
+
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Search failed" in result.output
+        assert "file is not a database" in result.output
 
     def test_search_error(self):
         from sec_semantic_search.core.exceptions import SearchError
