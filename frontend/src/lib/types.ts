@@ -118,14 +118,24 @@ export interface AdminSessionResponse {
 // Search
 // ---------------------------------------------------------------------------
 
-/** A single search result.
+/** Parent segment text as sent by `POST /api/search/`.
  *
- * `content` is the small chunk that scored against the query vector.
- * `parent_content` is the broader segment that chunk came from — use
- * it as the display body and highlight `content` inside it. Falls back
- * to `content` when `parent_content` is null (legacy data).
+ * Segments over the API's length cap arrive as an excerpt around the
+ * matched chunks; the flags say which ends were cut.
  */
-export interface SearchResult {
+export interface ParentSegment {
+  content: string;
+  truncated_start: boolean;
+  truncated_end: boolean;
+}
+
+/** A search result as sent over the wire.
+ *
+ * Each parent segment travels once, on the first result that cites it;
+ * later results citing the same segment carry only `parent_key`.
+ * `hydrateSearchResponse()` in `lib/api.ts` resolves it per result.
+ */
+export interface SearchResultWire {
   content: string;
   path: string;
   content_type: "text" | "textsmall" | "table";
@@ -136,7 +146,23 @@ export interface SearchResult {
   accession_number?: string | null;
   chunk_id?: string | null;
   segment_index?: number | null;
+  parent_key?: string | null;
+  parent?: ParentSegment | null;
+}
+
+/** A single search result, with its parent segment resolved.
+ *
+ * `content` is the small chunk that scored against the query vector.
+ * `parent_content` is the broader segment that chunk came from — use
+ * it as the display body and highlight `content` inside it. Falls back
+ * to `content` when `parent_content` is null (single-chunk segment or
+ * legacy data). The truncation flags are set when the parent is an
+ * excerpt of a longer segment.
+ */
+export interface SearchResult extends Omit<SearchResultWire, "parent_key" | "parent"> {
   parent_content?: string | null;
+  parent_truncated_start?: boolean;
+  parent_truncated_end?: boolean;
 }
 
 /** POST /api/search/ — request body */
@@ -151,7 +177,14 @@ export interface SearchRequest {
   end_date?: string | null;
 }
 
-/** POST /api/search/ — response (query intentionally omitted; see §F4). */
+/** POST /api/search/ — response as sent (query intentionally omitted; see §F4). */
+export interface SearchResponseWire {
+  results: SearchResultWire[];
+  total_results: number;
+  search_time_ms: number;
+}
+
+/** POST /api/search/ — response after `hydrateSearchResponse()`. */
 export interface SearchResponse {
   results: SearchResult[];
   total_results: number;

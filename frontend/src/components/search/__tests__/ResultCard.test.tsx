@@ -11,6 +11,8 @@
  *   2. parent_content present but missing the chunk text → fall back
  *      to plain parent text (no <mark>).
  *   3. parent_content absent → render the chunk text directly.
+ *   4. parent_content is an excerpt of a long segment → mark the cut
+ *      ends, or show the chunk when the excerpt does not contain it.
  */
 
 import { render, screen } from "@testing-library/react";
@@ -86,5 +88,30 @@ describe("ResultCard parent-context display", () => {
     );
     expect(screen.queryByTestId("chunk-highlight")).not.toBeInTheDocument();
     expect(screen.getByText("legacy chunk content")).toBeInTheDocument();
+  });
+  it("marks the cut ends of an excerpt and still highlights the chunk", () => {
+    const result: SearchResult = {
+      ...baseResult,
+      parent_content: "middle of a long table with chunk text inside it",
+      parent_truncated_start: true,
+      parent_truncated_end: true,
+    };
+    renderWithProviders(<ResultCard result={result} rank={1} isExpanded />);
+    expect(screen.getByTestId("chunk-highlight")).toHaveTextContent("chunk text");
+    const body = screen.getByTestId("chunk-highlight").parentElement!;
+    expect(body.textContent).toMatch(/^… middle of a long table/);
+    expect(body.textContent).toMatch(/inside it …$/);
+  });
+
+  it("shows the chunk when an excerpt does not contain it", () => {
+    const result: SearchResult = {
+      ...baseResult,
+      content: "row far outside the excerpt",
+      parent_content: "unrelated excerpt text",
+      parent_truncated_end: true,
+    };
+    renderWithProviders(<ResultCard result={result} rank={1} isExpanded />);
+    expect(screen.getByText("row far outside the excerpt")).toBeInTheDocument();
+    expect(screen.queryByText(/unrelated excerpt text/)).not.toBeInTheDocument();
   });
 });

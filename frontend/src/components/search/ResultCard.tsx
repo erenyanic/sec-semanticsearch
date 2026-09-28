@@ -128,9 +128,23 @@ export function ResultCard({
 
   // Prefer the parent segment text so the analyst sees the broader
   // paragraph; highlight the embedded chunk inside it. Falls back to
-  // the chunk text directly when parent_content is absent (legacy
-  // chunks ingested before the parent-context change).
-  const fullContent = result.parent_content ?? result.content;
+  // the chunk text directly when parent_content is absent (single-chunk
+  // segments and legacy chunks ingested before the parent-context
+  // change), and when the parent is an excerpt of a very long segment
+  // that does not contain the chunk.
+  const isExcerpt = Boolean(
+    result.parent_truncated_start || result.parent_truncated_end,
+  );
+  const parent =
+    result.parent_content &&
+    !(isExcerpt && !result.parent_content.includes(result.content))
+      ? result.parent_content
+      : null;
+  const fullContent = parent
+    ? `${result.parent_truncated_start ? "… " : ""}${parent}${
+        result.parent_truncated_end ? " …" : ""
+      }`
+    : result.content;
   const needsTruncation = fullContent.length > PREVIEW_LENGTH;
   const displayContent =
     isExpanded || !needsTruncation
@@ -141,7 +155,7 @@ export function ResultCard({
   // text appears verbatim inside the displayed slice (otherwise the
   // chunk would either be missing or span the truncation boundary).
   const highlightParts =
-    result.parent_content && result.parent_content !== result.content
+    parent && parent !== result.content
       ? splitForHighlight(displayContent, result.content)
       : null;
 

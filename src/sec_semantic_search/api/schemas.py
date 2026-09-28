@@ -228,6 +228,19 @@ class ClearAllResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ParentSegmentSchema(BaseModel):
+    """
+    Parent segment text shared by every result that references it.
+
+    Segments longer than the API's cap are sent as an excerpt around the
+    matched chunks; the two flags say which ends were cut.
+    """
+
+    content: str
+    truncated_start: bool = Field(False, description="Text before the excerpt was omitted")
+    truncated_end: bool = Field(False, description="Text after the excerpt was omitted")
+
+
 class SearchResultSchema(BaseModel):
     """
     A single result from a semantic search query.
@@ -236,11 +249,13 @@ class SearchResultSchema(BaseModel):
     to keep the API contract stable and framework-agnostic.
 
     ``content`` is the short embedded chunk (what the vector match was
-    scored against). ``parent_content`` is the broader segment that the
-    chunk was carved out of — clients should render ``parent_content``
-    when present and highlight ``content`` inside it. When
-    ``parent_content`` is ``None`` (legacy data with no segment row),
-    clients fall back to displaying ``content`` directly.
+    scored against). ``parent`` is the broader segment the chunk was
+    carved out of — clients render it and highlight ``content`` inside
+    it. Each segment is sent once, with the first result that cites it;
+    later results citing the same segment carry only ``parent_key``.
+    ``parent_key`` is ``None`` when the parent adds nothing to
+    ``content`` (the segment is a single chunk) or is unavailable
+    (legacy data with no segment row); clients then display ``content``.
     """
 
     content: str
@@ -256,9 +271,13 @@ class SearchResultSchema(BaseModel):
         None,
         description="Zero-based position of the parent segment within the filing",
     )
-    parent_content: str | None = Field(
+    parent_key: str | None = Field(
         None,
-        description="Full text of the parent segment for display (None for legacy chunks)",
+        description="Parent segment key ('{accession}:{segment_index}')",
+    )
+    parent: ParentSegmentSchema | None = Field(
+        None,
+        description="Parent segment text; only on the first result citing parent_key",
     )
 
 

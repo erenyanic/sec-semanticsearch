@@ -28,8 +28,10 @@ import type {
   GPUStatusResponse,
   GPUUnloadResponse,
   IngestRequest,
+  ParentSegment,
   SearchRequest,
   SearchResponse,
+  SearchResponseWire,
   StatusResponse,
   TaskListResponse,
   TaskResponse,
@@ -226,10 +228,36 @@ export async function logoutAdminSession(): Promise<void> {
 // Search
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve each result's parent segment.
+ *
+ * The API sends a parent once, on the first result that cites it, and
+ * only `parent_key` on later ones. Components read `parent_content`
+ * per result, so the lookup happens here, once, at the API boundary.
+ */
+export function hydrateSearchResponse(wire: SearchResponseWire): SearchResponse {
+  const parents = new Map<string, ParentSegment>();
+  const results = wire.results.map(({ parent_key, parent, ...rest }) => {
+    if (parent_key && parent) parents.set(parent_key, parent);
+    const resolved = parent_key ? parents.get(parent_key) : undefined;
+    return {
+      ...rest,
+      parent_content: resolved?.content ?? null,
+      parent_truncated_start: resolved?.truncated_start ?? false,
+      parent_truncated_end: resolved?.truncated_end ?? false,
+    };
+  });
+  return {
+    results,
+    total_results: wire.total_results,
+    search_time_ms: wire.search_time_ms,
+  };
+}
+
 /** Execute a semantic search query. */
 export async function search(body: SearchRequest): Promise<SearchResponse> {
-  const { data } = await client.post<SearchResponse>("/api/search/", body);
-  return data;
+  const { data } = await client.post<SearchResponseWire>("/api/search/", body);
+  return hydrateSearchResponse(data);
 }
 
 // ---------------------------------------------------------------------------

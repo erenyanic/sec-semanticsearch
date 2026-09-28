@@ -62,12 +62,11 @@ class TestSearchEndpoint:
         assert data["results"][0]["content_type"] == "text"
 
     def test_parent_context_fields_in_response(self):
-        """parent_content and segment_index round-trip through the schema.
+        """The parent segment travels with the result and is referenced by key.
 
-        The route copies these from ``SearchResult`` straight onto the
-        wire so the frontend can render the broader paragraph and
-        highlight the matched chunk. Verified end-to-end against a
-        mocked engine so the test stays fast and deterministic.
+        The frontend renders the parent and highlights the matched chunk
+        inside it. Verified against a mocked engine so the test stays fast
+        and deterministic.
         """
         results = [
             _make_result(
@@ -82,8 +81,13 @@ class TestSearchEndpoint:
         assert resp.status_code == 200
         payload = resp.json()["results"][0]
         assert payload["segment_index"] == 4
-        assert payload["parent_content"].startswith("Operating cash flow")
-        assert payload["content"] in payload["parent_content"]
+        assert "parent_content" not in payload
+        assert payload["parent_key"] == "0000320193-24-000001:4"
+        parent = payload["parent"]
+        assert parent["content"].startswith("Operating cash flow")
+        assert payload["content"] in parent["content"]
+        assert parent["truncated_start"] is False
+        assert parent["truncated_end"] is False
 
     def test_parent_context_fields_default_to_none(self):
         """Legacy results without parent context must still serialise."""
@@ -92,7 +96,8 @@ class TestSearchEndpoint:
         resp = client.post("/api/search/", json={"query": "revenue"})
         payload = resp.json()["results"][0]
         assert payload["segment_index"] is None
-        assert payload["parent_content"] is None
+        assert payload["parent_key"] is None
+        assert payload["parent"] is None
 
     def test_valid_query_no_results(self):
         client, _ = _make_client(search_results=[])

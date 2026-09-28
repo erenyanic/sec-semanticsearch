@@ -7,17 +7,23 @@ Provides a single route:
 
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from sec_semantic_search.api.dependencies import get_search_engine
 from sec_semantic_search.api.schemas import (
     ErrorResponse,
+    ParentSegmentSchema,
     SearchRequest,
     SearchResponse,
     SearchResultSchema,
 )
-from sec_semantic_search.core import EmbeddingBusyError, SearchError, get_logger, redact_for_log
+from sec_semantic_search.core import (
+    EmbeddingBusyError,
+    SearchError,
+    SearchResult,
+    get_logger,
+    redact_for_log,
+)
 from sec_semantic_search.search import SearchEngine
 
 logger = get_logger(__name__)
@@ -28,6 +34,71 @@ router = APIRouter()
 # a model load holds it. Past this the caller gets a retryable 503 instead
 # of pinning a threadpool worker for the length of a whole filing's encode.
 _EMBED_WAIT_SECONDS = 30.0
+
+# Longest parent text returned per segment. Filing tables can run to tens
+# of kilobytes; with ``top_k`` up to 100 an uncapped response could reach
+# megabytes. Longer segments are sent as an excerpt around the matched
+# chunks.
+_PARENT_MAX_CHARS = 16_000
+
+
+def _parent_excerpt(parent: str, chunks: list[str]) -> ParentSegmentSchema:
+    """Return ``parent``, or a window of it that keeps the matched chunks.
+
+    ``chunks`` are the referencing results' chunk texts, best match first.
+    The window covers all of them when they fit, otherwise the best one.
+    A chunk not found verbatim is ignored; with none found the excerpt
+    starts at the beginning of the segment.
+    """
+    if len(parent) <= _PARENT_MAX_CHARS:
+        return ParentSegmentSchema(content=parent)
+
+    spans = [(i, i + len(c)) for c in chunks if (i := parent.find(c)) >= 0]
+    start = 0
+    if spans:
+        low, high = min(s for s, _ in spans), max(e for _, e in spans)
+        if high - low > _PARENT_MAX_CHARS:
+            low, high = spans[0]
+        centre = (low + high) // 2
+        start = max(0, min(centre - _PARENT_MAX_CHARS // 2, len(parent) - _PARENT_MAX_CHARS))
+    end = start + _PARENT_MAX_CHARS
+    return ParentSegmentSchema(
+        content=parent[start:end],
+        truncated_start=start > 0,
+        truncated_end=end < len(parent),
+    )
+
+
+def _build_parents(
+    results: list[SearchResult],
+) -> list[tuple[str | None, ParentSegmentSchema | None]]:
+    """Return each result's ``(parent_key, parent)``.
+
+    A segment's text goes with the first result that cites it; later
+    results get the key alone. Placing it there, next to the chunk it
+    contains, also lets gzip encode the chunk as a back-reference. A
+    result gets no key when its parent is missing or identical to its
+    chunk, so single-chunk segments are not sent twice.
+    """
+    chunks_by_key: dict[str, list[str]] = {}
+    for r in results:
+        if r.parent_content and r.parent_content != r.content:
+            key = f"{r.accession_number}:{r.segment_index}"
+            chunks_by_key.setdefault(key, []).append(r.content)
+
+    out: list[tuple[str | None, ParentSegmentSchema | None]] = []
+    sent: set[str] = set()
+    for r in results:
+        if not r.parent_content or r.parent_content == r.content:
+            out.append((None, None))
+            continue
+        key = f"{r.accession_number}:{r.segment_index}"
+        if key in sent:
+            out.append((key, None))
+        else:
+            sent.add(key)
+            out.append((key, _parent_excerpt(r.parent_content, chunks_by_key[key])))
+    return out
 
 
 # Plain ``def``: FastAPI runs it in the threadpool. Embedding, the ChromaDB
@@ -45,6 +116,7 @@ _EMBED_WAIT_SECONDS = 30.0
 )
 def search(
     body: SearchRequest,
+    response: Response,
     engine: SearchEngine = Depends(get_search_engine),
 ) -> SearchResponse:
     """
@@ -121,9 +193,10 @@ def search(
             accession_number=r.accession_number,
             chunk_id=r.chunk_id,
             segment_index=r.segment_index,
-            parent_content=r.parent_content,
+            parent_key=key,
+            parent=parent,
         )
-        for r in results
+        for r, (key, parent) in zip(results, _build_parents(results), strict=True)
     ]
 
     logger.info(
@@ -133,12 +206,12 @@ def search(
         elapsed_ms,
     )
 
-    payload = SearchResponse(
+    # Results derive from the private query; never let a cache keep them.
+    response.headers["Cache-Control"] = "no-store"
+    # Returning the model (not a JSONResponse) lets FastAPI serialize it
+    # straight to JSON bytes in pydantic-core.
+    return SearchResponse(
         results=result_schemas,
         total_results=len(result_schemas),
         search_time_ms=round(elapsed_ms, 1),
-    )
-    return JSONResponse(
-        content=payload.model_dump(),
-        headers={"Cache-Control": "no-store"},
     )

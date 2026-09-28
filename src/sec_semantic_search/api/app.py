@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -359,6 +360,15 @@ def create_app() -> FastAPI:
         openapi_url=None if is_protected else "/openapi.json",
         lifespan=lifespan,
     )
+
+    # -- Response compression -----------------------------------------------
+    # Innermost, so only application responses are compressed and every
+    # outer middleware (security headers included) sees the final headers.
+    # Filing text compresses several-fold; responses under 1 KB are left
+    # alone. No response echoes user input next to a secret, which keeps
+    # BREACH-style length attacks out of reach. Level 6 rather than
+    # Starlette's default 9: compression runs on the event loop.
+    application.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
     # -- Request body size limit --------------------------------------------
     application.add_middleware(ContentSizeLimitMiddleware)
