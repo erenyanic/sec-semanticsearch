@@ -7,6 +7,7 @@ Dependencies are mocked via ``app.dependency_overrides``.
 
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from sec_semantic_search.api.app import app
@@ -19,6 +20,7 @@ def _make_client(filings=None, chunk_count=0, get_filing_result=None):
     """Build a TestClient with mocked registry and chroma."""
     registry = MagicMock()
     registry.list_filings.return_value = filings or []
+    registry.list_filings_page.return_value = (filings or [], len(filings or []))
     registry.get_filing.return_value = get_filing_result
 
     chroma = MagicMock()
@@ -59,22 +61,59 @@ class TestListFilings:
     def test_filter_by_ticker(self):
         client, registry, _ = _make_client()
         client.get("/api/filings/?ticker=aapl")
-        registry.list_filings.assert_called_with(ticker="AAPL", form_type=None)
+        assert registry.list_filings_page.call_args.kwargs["ticker"] == "AAPL"
+        assert registry.list_filings_page.call_args.kwargs["form_type"] is None
 
     def test_filter_by_form_type(self):
         client, registry, _ = _make_client()
         client.get("/api/filings/?form_type=10-q")
-        registry.list_filings.assert_called_with(ticker=None, form_type="10-Q")
+        assert registry.list_filings_page.call_args.kwargs["ticker"] is None
+        assert registry.list_filings_page.call_args.kwargs["form_type"] == "10-Q"
 
-    def test_sort_by_ticker_asc(self):
-        filings = [
-            make_filing_record(id=1, ticker="MSFT", accession_number="0000000001-24-000001"),
-            make_filing_record(id=2, ticker="AAPL", accession_number="0000000002-24-000002"),
-        ]
-        client, *_ = _make_client(filings=filings)
-        data = client.get("/api/filings/?sort_by=ticker&order=asc").json()
-        tickers = [f["ticker"] for f in data["filings"]]
-        assert tickers == ["AAPL", "MSFT"]
+    def test_defaults_request_first_page_by_filing_date_desc(self):
+        client, registry, _ = _make_client()
+        client.get("/api/filings/")
+        registry.list_filings_page.assert_called_once_with(
+            ticker=None,
+            form_type=None,
+            sort_by="filing_date",
+            order="desc",
+            limit=25,
+            offset=0,
+        )
+
+    def test_sort_and_page_passed_to_registry(self):
+        client, registry, _ = _make_client()
+        client.get("/api/filings/?sort_by=ticker&order=asc&limit=10&offset=20")
+        kwargs = registry.list_filings_page.call_args.kwargs
+        assert (kwargs["sort_by"], kwargs["order"]) == ("ticker", "asc")
+        assert (kwargs["limit"], kwargs["offset"]) == (10, 20)
+
+    def test_total_counts_all_pages(self):
+        client, registry, _ = _make_client()
+        registry.list_filings_page.return_value = ([make_filing_record()], 137)
+        data = client.get("/api/filings/?limit=1").json()
+        assert len(data["filings"]) == 1
+        assert data["total"] == 137
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "limit=0",
+            "limit=201",
+            "offset=-1",
+            "offset=1000001",
+            "offset=99999999999999999999999",
+            "sort_by=id",
+            "sort_by=filing_date%3B%20DROP%20TABLE%20filings",
+            "order=sideways",
+        ],
+    )
+    def test_invalid_paging_or_sort_returns_422(self, query):
+        client, registry, _ = _make_client()
+        resp = client.get(f"/api/filings/?{query}")
+        assert resp.status_code == 422
+        registry.list_filings_page.assert_not_called()
 
 
 # -----------------------------------------------------------------------

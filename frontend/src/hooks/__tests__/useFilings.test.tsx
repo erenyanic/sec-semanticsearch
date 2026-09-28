@@ -68,13 +68,46 @@ describe("useFilings", () => {
       form_type: undefined,
       sort_by: "filing_date",
       order: "desc",
+      limit: 10,
+      offset: 0,
     });
+  });
+
+  it("requests the page as limit and offset", async () => {
+    mockGetFilings.mockResolvedValue({ filings: [], total: 0 });
+
+    const params = { ...DEFAULT_QUERY_PARAMS, page: 3, pageSize: 25 };
+    const { result } = renderHook(() => useFilings(params), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(mockGetFilings).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 25, offset: 75 }),
+    );
+  });
+
+  it("keeps the total across pages, not the page length", async () => {
+    mockGetFilings.mockResolvedValue({ filings: MOCK_FILINGS.filings, total: 57 });
+
+    const { result } = renderHook(() => useFilings(DEFAULT_QUERY_PARAMS), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.filings).toHaveLength(2));
+    expect(result.current.total).toBe(57);
   });
 
   it("passes ticker and form_type filters to API", async () => {
     mockGetFilings.mockResolvedValue({ filings: [], total: 0 });
 
-    const params = { ticker: "AAPL", formType: "10-K", sortBy: "ticker" as const, order: "asc" as const };
+    const params = {
+      ...DEFAULT_QUERY_PARAMS,
+      ticker: "AAPL",
+      formType: "10-K",
+      sortBy: "ticker" as const,
+      order: "asc" as const,
+    };
     const { result } = renderHook(() => useFilings(params), {
       wrapper: createWrapper(),
     });
@@ -85,6 +118,8 @@ describe("useFilings", () => {
       form_type: "10-K",
       sort_by: "ticker",
       order: "asc",
+      limit: 10,
+      offset: 0,
     });
   });
 
@@ -111,8 +146,9 @@ describe("useFilings", () => {
     expect(result.current.error?.message).toBe("Server error");
   });
 
-  it("deleteSingle removes filing from cache optimistically", async () => {
-    mockGetFilings.mockResolvedValue(MOCK_FILINGS);
+  it("deleteSingle removes filing from cache optimistically, then refetches", async () => {
+    const afterDelete = { filings: [MOCK_FILINGS.filings[1]], total: 1 };
+    mockGetFilings.mockResolvedValueOnce(MOCK_FILINGS).mockResolvedValue(afterDelete);
     mockDeleteFiling.mockResolvedValue({ accession_number: "0001-24-000001", chunks_deleted: 120 });
 
     const { result } = renderHook(() => useFilings(DEFAULT_QUERY_PARAMS), {
@@ -127,10 +163,33 @@ describe("useFilings", () => {
 
     await waitFor(() => expect(result.current.filings).toHaveLength(1));
     expect(result.current.filings[0].accession_number).toBe("0002-24-000002");
+    expect(result.current.total).toBe(1);
+    // The page refills from the server after the optimistic removal.
+    await waitFor(() => expect(mockGetFilings).toHaveBeenCalledTimes(2));
+  });
+
+  it("deleteSingle decrements the total instead of using the page length", async () => {
+    mockGetFilings
+      .mockResolvedValueOnce({ filings: MOCK_FILINGS.filings, total: 40 })
+      .mockReturnValue(new Promise(() => {})); // hold the refetch
+    mockDeleteFiling.mockResolvedValue({ accession_number: "0001-24-000001", chunks_deleted: 120 });
+
+    const { result } = renderHook(() => useFilings(DEFAULT_QUERY_PARAMS), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.total).toBe(40));
+
+    await act(async () => {
+      await result.current.deleteSingle("0001-24-000001");
+    });
+
+    await waitFor(() => expect(result.current.filings).toHaveLength(1));
+    expect(result.current.total).toBe(39);
   });
 
   it("deleteSelected removes multiple filings in a single batch request", async () => {
-    mockGetFilings.mockResolvedValue(MOCK_FILINGS);
+    mockGetFilings.mockResolvedValueOnce(MOCK_FILINGS).mockResolvedValue({ filings: [], total: 0 });
     mockDeleteFilingsByIds.mockResolvedValue({
       filings_deleted: 2,
       chunks_deleted: 200,

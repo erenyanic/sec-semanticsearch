@@ -826,6 +826,80 @@ class MetadataRegistry:
                 details=str(e),
             ) from e
 
+    # Columns ``list_filings_page`` may order by. ``ORDER BY`` takes no bound
+    # parameters, so the column and direction are checked against these
+    # before being written into the SQL.
+    SORTABLE_COLUMNS = frozenset(
+        {"filing_date", "ticker", "form_type", "chunk_count", "ingested_at"}
+    )
+
+    def list_filings_page(
+        self,
+        ticker: str | None = None,
+        form_type: str | None = None,
+        *,
+        sort_by: str = "filing_date",
+        order: str = "desc",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> tuple[list[FilingRecord], int]:
+        """
+        Return one sorted page of filings and the total matching the filters.
+
+        Sorting and slicing happen in SQLite; ``id`` breaks ties so pages
+        never overlap or skip rows. The count and the page are read under
+        one lock, so ``total`` always describes the same snapshot.
+
+        Args:
+            ticker: Filter by ticker symbol (case-insensitive).
+            form_type: Filter by form type (case-insensitive).
+            sort_by: One of ``SORTABLE_COLUMNS``.
+            order: ``"asc"`` or ``"desc"``.
+            limit: Page size (≥ 1).
+            offset: Rows to skip (≥ 0).
+
+        Returns:
+            ``(records, total)``.
+
+        Raises:
+            ValueError: If the sort column, order, limit or offset is invalid.
+            DatabaseError: If the query fails.
+        """
+        if sort_by not in self.SORTABLE_COLUMNS:
+            raise ValueError(f"Cannot sort filings by {sort_by!r}")
+        if order not in ("asc", "desc"):
+            raise ValueError(f"Sort order must be 'asc' or 'desc', not {order!r}")
+        if limit < 1 or offset < 0:
+            raise ValueError("limit must be ≥ 1 and offset ≥ 0")
+
+        where = " WHERE 1=1"
+        params: list = []
+        if ticker:
+            where += " AND ticker = ?"
+            params.append(ticker.upper())
+        if form_type:
+            where += " AND form_type = ?"
+            params.append(form_type.upper())
+
+        direction = order.upper()
+        page_sql = (
+            f"SELECT * FROM filings{where} "
+            f"ORDER BY {sort_by} {direction}, id {direction} LIMIT ? OFFSET ?"
+        )
+
+        try:
+            with self._lock:
+                total = self._conn.execute(
+                    f"SELECT COUNT(*) FROM filings{where}", params
+                ).fetchone()[0]
+                rows = self._conn.execute(page_sql, [*params, limit, offset]).fetchall()
+            return [self._row_to_record(row) for row in rows], total
+        except self._db_error as e:
+            raise DatabaseError(
+                "Failed to list filings",
+                details=str(e),
+            ) from e
+
     def list_oldest_filings(self, limit: int) -> list[FilingRecord]:
         """
         Return the oldest filings ordered by ingestion time (ascending).

@@ -43,6 +43,13 @@ logger = get_logger(__name__)
 
 router = APIRouter()
 
+# Page-size ceiling for GET /api/filings/. The UI asks for at most 50 rows.
+_MAX_PAGE_SIZE = 200
+
+# Offset ceiling. Pydantic accepts arbitrarily large integers, and one past
+# SQLite's 64-bit range would surface as a 500; no deployment holds more.
+_MAX_OFFSET = 1_000_000
+
 
 def _record_to_schema(record: FilingRecord) -> FilingSchema:
     """Convert a database ``FilingRecord`` to an API ``FilingSchema``."""
@@ -69,27 +76,24 @@ def list_filings(
         "filing_date", description="Column to sort by"
     ),
     order: Literal["asc", "desc"] = Query("desc", description="Sort order"),
+    limit: int = Query(25, ge=1, le=_MAX_PAGE_SIZE, description="Page size"),
+    offset: int = Query(0, ge=0, le=_MAX_OFFSET, description="Rows to skip"),
 ) -> FilingListResponse:
     """
-    List all ingested filings with optional filters and sorting.
+    List one page of ingested filings with optional filters and sorting.
 
-    Results are returned in the order specified by ``sort_by`` and ``order``.
-    The underlying registry always returns filings ordered by filing_date
-    descending; additional sorting is applied in-memory.
+    SQLite filters, sorts and slices; ``total`` counts every filing that
+    matches the filters, not just the returned page.
     """
-    records = registry.list_filings(
+    records, total = registry.list_filings_page(
         ticker=ticker.upper() if ticker else None,
         form_type=form_type.upper() if form_type else None,
+        sort_by=sort_by,
+        order=order,
+        limit=limit,
+        offset=offset,
     )
-
-    # Apply sorting.  The registry returns filing_date DESC by default,
-    # so we only need to re-sort when the caller requests something else.
-    if sort_by != "filing_date" or order != "desc":
-        reverse = order == "desc"
-        records.sort(key=lambda r: getattr(r, sort_by), reverse=reverse)
-
-    schemas = [_record_to_schema(r) for r in records]
-    return FilingListResponse(filings=schemas, total=len(schemas))
+    return FilingListResponse(filings=[_record_to_schema(r) for r in records], total=total)
 
 
 @router.get(

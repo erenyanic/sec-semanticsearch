@@ -32,8 +32,10 @@
  *
  * ## State ownership
  *
- *   - `params` (FilingQueryParams): filter + sort, synced with URL
- *   - `selected` (Set<string>): row checkboxes, cleared on filter change
+ *   - `params` (FilingQueryParams): filter + sort (synced with URL) and
+ *     page + page size (local; reset to page 0 when filters or sort change)
+ *   - `selected` (Set<string>): row checkboxes on the current page, cleared
+ *     whenever the visible rows are re-queried (filter, sort or page change)
  *   - `deleteTarget` (DeleteTarget | null): controls the delete dialog
  */
 
@@ -80,6 +82,8 @@ function FilingsContent() {
     order:
       (searchParams.get("order") as FilingQueryParams["order"]) ??
       DEFAULT_QUERY_PARAMS.order,
+    page: DEFAULT_QUERY_PARAMS.page,
+    pageSize: DEFAULT_QUERY_PARAMS.pageSize,
   }));
 
   // ---- State: row selection ----
@@ -112,13 +116,29 @@ function FilingsContent() {
 
     const qs = sp.toString();
     router.replace(`/filings${qs ? `?${qs}` : ""}`, { scroll: false });
-  }, [params, router]);
+  }, [params.ticker, params.formType, params.sortBy, params.order, router]);
 
-  // ---- Clear selection when filters change ----
-  // Selection may reference filings that no longer appear in the list.
+  // ---- Clear selection when the visible rows are re-queried ----
+  // Pages come from the server, so a selection can only cover the rows
+  // on screen; it would otherwise reference filings the page no longer
+  // holds (and the delete dialog could not count their chunks).
   useEffect(() => {
     setSelected(new Set());
-  }, [params.ticker, params.formType]);
+  }, [
+    params.ticker,
+    params.formType,
+    params.sortBy,
+    params.order,
+    params.page,
+    params.pageSize,
+  ]);
+
+  /** Step back one page when a delete empties the current one. */
+  function afterDelete(deletedOnPage: number) {
+    if (params.page > 0 && deletedOnPage >= filing.filings.length) {
+      setParams({ ...params, page: params.page - 1 });
+    }
+  }
 
   // ---- Delete handlers ----
   const handleDeleteSingle = useCallback((filing: { ticker: string; form_type: string; accession_number: string }) => {
@@ -159,6 +179,7 @@ function FilingsContent() {
             next.delete(deleteTarget.filing.accession_number);
             setSelected(next);
           }
+          afterDelete(1);
           addToast(
             "success",
             `Deleted ${deleteTarget.filing.ticker} ${deleteTarget.filing.form_type}`,
@@ -167,12 +188,14 @@ function FilingsContent() {
         }
         case "selected": {
           await filing.deleteSelected([...selected]);
+          afterDelete(selected.size);
           setSelected(new Set());
           addToast("success", `Deleted ${deleteTarget.count} filings`);
           break;
         }
         case "all": {
           await filing.clearAll();
+          setParams({ ...params, page: 0 });
           setSelected(new Set());
           addToast("success", "All filings deleted");
           break;
@@ -259,8 +282,10 @@ function FilingsContent() {
         <FilingFilters
           ticker={params.ticker}
           formType={params.formType}
-          onTickerChange={(ticker) => setParams({ ...params, ticker })}
-          onFormTypeChange={(formType) => setParams({ ...params, formType })}
+          onTickerChange={(ticker) => setParams({ ...params, ticker, page: 0 })}
+          onFormTypeChange={(formType) =>
+            setParams({ ...params, formType, page: 0 })
+          }
           availableTickers={status?.tickers ?? []}
           availableFormTypes={Object.keys(status?.form_breakdown ?? {})}
         />
@@ -277,10 +302,17 @@ function FilingsContent() {
       {/* Table */}
       <FilingTable
         filings={filing.filings}
+        total={filing.total}
+        page={params.page}
+        pageSize={params.pageSize}
+        onPageChange={(page) => setParams({ ...params, page })}
+        onPageSizeChange={(pageSize) =>
+          setParams({ ...params, pageSize, page: 0 })
+        }
         sortBy={params.sortBy}
         order={params.order}
         onSortChange={(sortBy, order) =>
-          setParams({ ...params, sortBy, order })
+          setParams({ ...params, sortBy, order, page: 0 })
         }
         selected={selected}
         onSelectionChange={setSelected}

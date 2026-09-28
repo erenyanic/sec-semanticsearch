@@ -144,9 +144,13 @@ export interface FilingListParams {
   form_type?: string;
   sort_by?: "filing_date" | "ticker" | "form_type" | "chunk_count" | "ingested_at";
   order?: "asc" | "desc";
+  /** Page size (1–200). */
+  limit?: number;
+  /** Rows to skip. */
+  offset?: number;
 }
 
-/** List filings with optional filters. */
+/** List one page of filings; `total` counts every match across pages. */
 export async function getFilings(
   params?: FilingListParams,
 ): Promise<FilingListResponse> {

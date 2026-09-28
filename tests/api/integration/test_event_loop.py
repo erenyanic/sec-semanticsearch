@@ -110,7 +110,7 @@ class TestHandlersRunInThreadpool:
     def test_list_filings_runs_off_loop(self):
         calls: list[bool] = []
         registry = MagicMock()
-        registry.list_filings.side_effect = _recording(calls, return_value=[_record()])
+        registry.list_filings_page.side_effect = _recording(calls, return_value=([_record()], 1))
         app.dependency_overrides[get_registry] = lambda: registry
 
         resp = TestClient(app).get("/api/filings/")

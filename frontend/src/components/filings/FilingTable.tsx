@@ -9,10 +9,10 @@
  * column activates it with `desc` default. Sort params are sent to the
  * backend — the hook refetches on change.
  *
- * **Client-side pagination:** The backend returns all filings (max
- * ~100); the table slices locally. If a filter change or deletion
- * leaves the current page beyond the end, we fall back to page 0 via
- * a render-time clamp (no useEffect — React 19 lint rule).
+ * **Server-side pagination:** The backend returns one sorted page and
+ * the total match count; the page index and size live in the page
+ * component's query params. If an eviction elsewhere leaves the current
+ * page past the end, the footer stays so the user can step back.
  *
  * **Row selection:** Checkboxes in the first column; the header
  * checkbox applies to the current page only. Selection lives in the
@@ -48,8 +48,18 @@ import { Button, useToast } from "@/components/ui";
 type SortColumn = NonNullable<FilingListParams["sort_by"]>;
 
 interface FilingTableProps {
-  /** Filings to display (already server-sorted). */
+  /** The current page of filings (already server-sorted and sliced). */
   filings: Filing[];
+  /** Filings matching the filters across all pages. */
+  total: number;
+  /** Zero-based page index. */
+  page: number;
+  /** Rows per page. */
+  pageSize: number;
+  /** Called when the user moves to another page. */
+  onPageChange: (page: number) => void;
+  /** Called when the user picks another page size. */
+  onPageSizeChange: (pageSize: number) => void;
   /** Current sort column. */
   sortBy: SortColumn;
   /** Current sort direction. */
@@ -89,6 +99,7 @@ const COLUMNS: Column[] = [
 // Page size options
 // ---------------------------------------------------------------------------
 
+/** No option above 50: "select all on page" feeds delete-by-ids (max 50). */
 const PAGE_SIZES = [10, 25, 50] as const;
 
 // ---------------------------------------------------------------------------
@@ -106,6 +117,11 @@ const BODY_CELL = "px-5 py-3.5 text-sm";
 
 export function FilingTable({
   filings,
+  total,
+  page,
+  pageSize,
+  onPageChange,
+  onPageSizeChange,
   sortBy,
   order,
   onSortChange,
@@ -132,17 +148,11 @@ export function FilingTable({
     [addToast],
   );
 
-  // ---- Pagination state (local to the table) ----
-  const [rawPage, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState<number>(10);
-
-  // Render-time clamp — if filters/deletions shrink the list, fall back
-  // to page 0 rather than resetting via useEffect.
-  const totalPages = Math.max(1, Math.ceil(filings.length / pageSize));
-  const page = rawPage >= totalPages ? 0 : rawPage;
+  // ---- Pagination (controlled by the page component) ----
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const startIndex = page * pageSize;
-  const endIndex = Math.min(startIndex + pageSize, filings.length);
-  const visibleFilings = filings.slice(startIndex, endIndex);
+  const endIndex = startIndex + filings.length;
+  const visibleFilings = filings;
 
   // ---- Selection helpers ----
   const visibleAccessions = visibleFilings.map((f) => f.accession_number);
@@ -214,7 +224,7 @@ export function FilingTable({
   }, [visibleFilings]);
 
   // ---- Empty state: filters active but no matches ----
-  if (filings.length === 0) {
+  if (total === 0) {
     return (
       <div className="rounded-2xl border border-hairline bg-card/70 p-12 text-center shadow-sm backdrop-blur-sm">
         <p className="text-base text-fg-muted">
@@ -285,6 +295,16 @@ export function FilingTable({
           </thead>
 
           <tbody>
+            {visibleFilings.length === 0 && (
+              <tr>
+                <td
+                  colSpan={COLUMNS.length + 2}
+                  className={`${BODY_CELL} text-center text-fg-muted`}
+                >
+                  No filings on this page
+                </td>
+              </tr>
+            )}
             {visibleFilings.map((filing) => {
               const isSelected = selected.has(filing.accession_number);
               return (
@@ -381,15 +401,17 @@ export function FilingTable({
       {/* ---- Pagination footer ---- */}
       <div className="flex flex-wrap items-center justify-between gap-4 px-2">
         <span className="text-sm tabular-nums text-fg-muted">
-          <span className="font-semibold text-fg">{startIndex + 1}</span>
+          <span className="font-semibold text-fg">
+            {Math.min(startIndex + 1, endIndex)}
+          </span>
           <span className="text-fg-subtle">–</span>
           <span className="font-semibold text-fg">{endIndex}</span>
           <span className="text-fg-subtle"> of </span>
           <span className="font-semibold text-fg">
-            {filings.length.toLocaleString()}
+            {total.toLocaleString()}
           </span>
           <span className="text-fg-subtle">
-            {" "}filing{filings.length === 1 ? "" : "s"}
+            {" "}filing{total === 1 ? "" : "s"}
           </span>
         </span>
 
@@ -404,10 +426,7 @@ export function FilingTable({
           <select
             id="page-size"
             value={pageSize}
-            onChange={(e) => {
-              setPageSize(Number(e.target.value));
-              setPage(0);
-            }}
+            onChange={(e) => onPageSizeChange(Number(e.target.value))}
             className="rounded-lg border border-hairline bg-card px-3 py-1.5 text-sm tabular-nums text-fg outline-none transition-colors hover:border-accent/40 focus:border-accent focus:ring-2 focus:ring-accent/25"
           >
             {PAGE_SIZES.map((size) => (
@@ -423,7 +442,7 @@ export function FilingTable({
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => setPage((p) => Math.max(0, p - 1))}
+            onClick={() => onPageChange(Math.max(0, Math.min(page, totalPages) - 1))}
             disabled={page === 0}
             aria-label="Previous page"
             className="text-fg-muted hover:text-fg"
@@ -438,7 +457,7 @@ export function FilingTable({
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+            onClick={() => onPageChange(Math.min(totalPages - 1, page + 1))}
             disabled={page >= totalPages - 1}
             aria-label="Next page"
             className="text-fg-muted hover:text-fg"

@@ -1,26 +1,25 @@
 /**
  * useFilings — data hook for the Filings page.
  *
- * Bundles a parameterised query (filing list with filters/sort) and three
- * delete mutations (single, multi-select, clear-all) behind a single
- * hook interface. The page never touches React Query directly.
+ * Bundles a parameterised query (one page of filings with filters/sort)
+ * and three delete mutations (single, multi-select, clear-all) behind a
+ * single hook interface. The page never touches React Query directly.
  *
  * ## Query key
  *
- *   `["filings", ticker, formType, sortBy, order]`
+ *   `["filings", ticker, formType, sortBy, order, page, pageSize]`
  *
- * Changing any parameter automatically triggers a refetch because React
- * Query treats each unique key combination as a separate cache entry.
+ * The API filters, sorts and slices in SQLite and returns one page plus
+ * the total match count, so each page is its own cache entry. The
+ * previous page stays on screen while the next one loads.
  *
  * ## Cache strategy after deletions
  *
- *   - **Single delete:** optimistic removal — we know exactly which
- *     filing was deleted, so we splice it out of the cached list for
- *     instant visual feedback.
- *   - **Multi-select delete:** loops single delete sequentially.
- *     Each call optimistically removes its filing from the cache.
- *   - **Clear all:** sets the cache to `{ filings: [], total: 0 }`
- *     immediately (everything is gone).
+ *   - **Single / multi-select delete:** remove the rows from the cached
+ *     page at once for instant feedback, decrement `total`, then
+ *     invalidate every `["filings"]` entry so the page refills from the
+ *     next one and other pages re-sync.
+ *   - **Clear all:** set every cached page to `{ filings: [], total: 0 }`.
  *
  * All mutations also invalidate `["status"]` so the Dashboard's counts
  * update without a manual refresh.
@@ -28,7 +27,12 @@
 
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type {
   Filing,
   FilingListResponse,
@@ -48,12 +52,16 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
-/** Parameters controlling which filings to fetch and how to sort them. */
+/** Parameters controlling which page of filings to fetch and how to sort it. */
 export interface FilingQueryParams {
   ticker: string;
   formType: string;
   sortBy: NonNullable<FilingListParams["sort_by"]>;
   order: "asc" | "desc";
+  /** Zero-based page index. */
+  page: number;
+  /** Rows per page. At most 50, the delete-by-ids batch limit. */
+  pageSize: number;
 }
 
 export const DEFAULT_QUERY_PARAMS: FilingQueryParams = {
@@ -61,12 +69,14 @@ export const DEFAULT_QUERY_PARAMS: FilingQueryParams = {
   formType: "",
   sortBy: "filing_date",
   order: "desc",
+  page: 0,
+  pageSize: 10,
 };
 
 export interface UseFilingsReturn {
-  /** Filings matching the current filters, server-sorted. */
+  /** The current page of filings matching the filters, server-sorted. */
   filings: Filing[];
-  /** Total count of filings matching the current filters. */
+  /** Total count of filings matching the current filters, across pages. */
   total: number;
   /** True while the filing list is loading. */
   isLoading: boolean;
@@ -93,16 +103,18 @@ export function useFilings(params: FilingQueryParams): UseFilingsReturn {
   const queryClient = useQueryClient();
 
   // The query key encodes every parameter so React Query refetches
-  // automatically when the user changes a filter or sort column.
+  // automatically when the user changes a filter, sort column or page.
   const queryKey = [
     "filings",
     params.ticker,
     params.formType,
     params.sortBy,
     params.order,
+    params.page,
+    params.pageSize,
   ];
 
-  // ---- Query: fetch filing list ----
+  // ---- Query: fetch one page ----
   const { data, isLoading, isError, error } = useQuery<FilingListResponse>({
     queryKey,
     queryFn: () =>
@@ -111,30 +123,36 @@ export function useFilings(params: FilingQueryParams): UseFilingsReturn {
         form_type: params.formType || undefined,
         sort_by: params.sortBy,
         order: params.order,
+        limit: params.pageSize,
+        offset: params.page * params.pageSize,
       }),
+    // Keep the previous page on screen while the next one loads.
+    placeholderData: keepPreviousData,
   });
+
+  /** Remove deleted rows from the cached page and refetch every page. */
+  function removeFromCache(accessionNumbers: string[]) {
+    const deleted = new Set(accessionNumbers);
+    queryClient.setQueryData<FilingListResponse>(queryKey, (old) => {
+      if (!old) return old;
+      const filtered = old.filings.filter((f) => !deleted.has(f.accession_number));
+      const removed = old.filings.length - filtered.length;
+      return { filings: filtered, total: Math.max(0, old.total - removed) };
+    });
+    // Rows from later pages move up; other cached pages are now stale.
+    queryClient.invalidateQueries({ queryKey: ["filings"] });
+    // Dashboard counts should update too.
+    queryClient.invalidateQueries({ queryKey: ["status"] });
+  }
 
   // ---- Mutation: delete a single filing ----
   const singleDelete = useMutation<DeleteResponse, Error, string>({
     mutationFn: deleteFiling,
-    onSuccess: (_result, accessionNumber) => {
-      // Optimistic removal: splice the deleted filing out of the
-      // cached list. This gives instant visual feedback — the row
-      // disappears without waiting for a refetch.
-      queryClient.setQueryData<FilingListResponse>(queryKey, (old) => {
-        if (!old) return old;
-        const filtered = old.filings.filter(
-          (f) => f.accession_number !== accessionNumber,
-        );
-        return { filings: filtered, total: filtered.length };
-      });
-      // Dashboard counts should update too.
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-    },
+    onSuccess: (_result, accessionNumber) => removeFromCache([accessionNumber]),
     onError: () => {
-      // Filing may have been evicted (demo mode FIFO) — refetch the
-      // list so the stale row disappears from the table.
-      queryClient.invalidateQueries({ queryKey });
+      // Filing may have been evicted (demo mode FIFO) — refetch so the
+      // stale row disappears from the table.
+      queryClient.invalidateQueries({ queryKey: ["filings"] });
       queryClient.invalidateQueries({ queryKey: ["status"] });
     },
   });
@@ -143,11 +161,11 @@ export function useFilings(params: FilingQueryParams): UseFilingsReturn {
   const clearMutation = useMutation<ClearAllResponse, Error, void>({
     mutationFn: clearAllFilings,
     onSuccess: () => {
-      // Everything is gone. Set the cache to empty immediately.
-      queryClient.setQueryData<FilingListResponse>(queryKey, {
-        filings: [],
-        total: 0,
-      });
+      // Everything is gone: empty every cached page immediately.
+      queryClient.setQueriesData<FilingListResponse>(
+        { queryKey: ["filings"] },
+        { filings: [], total: 0 },
+      );
       queryClient.invalidateQueries({ queryKey: ["status"] });
     },
   });
@@ -155,19 +173,7 @@ export function useFilings(params: FilingQueryParams): UseFilingsReturn {
   // Multi-select delete: single batch request via POST /api/filings/delete-by-ids.
   const batchDelete = useMutation<DeleteByIdsResponse, Error, string[]>({
     mutationFn: deleteFilingsByIds,
-    onSuccess: (_result, accessionNumbers) => {
-      // Optimistic removal: splice all deleted filings from the cache
-      // in a single update for instant visual feedback.
-      const deletedSet = new Set(accessionNumbers);
-      queryClient.setQueryData<FilingListResponse>(queryKey, (old) => {
-        if (!old) return old;
-        const filtered = old.filings.filter(
-          (f) => !deletedSet.has(f.accession_number),
-        );
-        return { filings: filtered, total: filtered.length };
-      });
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-    },
+    onSuccess: (_result, accessionNumbers) => removeFromCache(accessionNumbers),
   });
 
   const isDeleting =

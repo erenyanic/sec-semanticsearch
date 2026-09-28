@@ -123,10 +123,10 @@ class FilingSchema(BaseModel):
 
 
 class FilingListResponse(BaseModel):
-    """Response for ``GET /api/filings/``."""
+    """Response for ``GET /api/filings/`` — one page of filings."""
 
     filings: list[FilingSchema]
-    total: int = Field(..., ge=0)
+    total: int = Field(..., ge=0, description="Filings matching the filters, across all pages")
 
 
 class DeleteResponse(BaseModel):
