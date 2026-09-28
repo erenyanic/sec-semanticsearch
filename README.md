@@ -30,7 +30,7 @@ Filing content is fetched from SEC EDGAR, parsed into structured sections, split
 - **No query or credential storage** — Search queries are embedded in memory, used for retrieval, then discarded; no table or file records them. Per-session EDGAR credentials are never stored server-side
 - **Encryption at rest** — Optional SQLCipher encryption for the SQLite metadata database
 - **Two-tier access control** — Separate API key and admin key; admin key never exposed in browser code
-- **Demo mode** — FIFO eviction when the filing limit is reached; nightly reset notice in the UI
+- **Demo mode** — FIFO eviction when the filing limit is reached; temporary-data notice in the UI
 - **Flexible filtering** — Search and manage by ticker, form type, or date range
 - **Duplicate detection** — Checks for existing filings before any GPU work begins
 - **Configuration-driven deployment** — Three deployment scenarios (local, team, public) controlled entirely via environment variables
@@ -118,7 +118,7 @@ The SEC requires a name and email in the User-Agent header of every EDGAR reques
 | `API_KEY`              | unset                        | General API access key; unset = no authentication |
 | `API_ADMIN_KEY`        | unset                        | Admin key for destructive operations              |
 | `LOG_REDACT_QUERIES`   | `false`                      | Hash search queries and tickers in logs           |
-| `API_DEMO_MODE`        | `false`                      | FIFO eviction + nightly-reset notice              |
+| `API_DEMO_MODE`        | `false`                      | FIFO eviction + temporary-data notice             |
 
 See [`.env.example`](.env.example) for the full variable list with descriptions.
 

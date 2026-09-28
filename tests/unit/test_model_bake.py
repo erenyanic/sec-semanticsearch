@@ -181,6 +181,8 @@ class TestComposeModelCache:
     def test_entrypoint_chowns_hf_cache(self):
         entrypoint = (PROJECT_ROOT / "docker-entrypoint.sh").read_text()
         assert 'HF_CACHE_DIR="${HF_HOME:-/opt/hf}"' in entrypoint
-        assert 'mkdir -p "$HF_CACHE_DIR"' in entrypoint
-        chown = next(line for line in entrypoint.splitlines() if line.startswith("chown "))
+        lines = entrypoint.splitlines()
+        mkdir = next(line for line in lines if line.startswith("mkdir -p "))
+        chown = next(line for line in lines if line.startswith("chown "))
+        assert '"$HF_CACHE_DIR"' in mkdir
         assert '"$HF_CACHE_DIR"' in chown

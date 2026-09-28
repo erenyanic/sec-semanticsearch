@@ -55,7 +55,7 @@ describe("DemoBanner", () => {
     } as ReturnType<typeof useStatus>);
 
     renderBanner();
-    expect(screen.getByText(/Data resets nightly at midnight UTC/)).toBeInTheDocument();
+    expect(screen.getByText(/Data is temporary and may be cleared at any time/)).toBeInTheDocument();
   });
 
   it("hides banner when demo_mode is false", () => {
@@ -66,7 +66,7 @@ describe("DemoBanner", () => {
     } as ReturnType<typeof useStatus>);
 
     renderBanner();
-    expect(screen.queryByText(/Data resets nightly/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Data is temporary/)).not.toBeInTheDocument();
   });
 
   it("always renders children regardless of demo_mode", () => {
@@ -89,7 +89,7 @@ describe("DemoBanner", () => {
 
     renderBanner();
     expect(screen.getByTestId("app-content")).toBeInTheDocument();
-    expect(screen.queryByText(/Data resets nightly/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Data is temporary/)).not.toBeInTheDocument();
   });
 
   it("renders children when status has error (no banner)", () => {
@@ -101,7 +101,7 @@ describe("DemoBanner", () => {
 
     renderBanner();
     expect(screen.getByTestId("app-content")).toBeInTheDocument();
-    expect(screen.queryByText(/Data resets nightly/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Data is temporary/)).not.toBeInTheDocument();
   });
 
   it("banner has role=status for accessibility", () => {

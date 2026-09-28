@@ -10,7 +10,6 @@
 #   ./scripts/gcloud-deploy.sh setup      # Create infrastructure only
 #   ./scripts/gcloud-deploy.sh build      # Build and push images only
 #   ./scripts/gcloud-deploy.sh deploy     # Deploy services only
-#   ./scripts/gcloud-deploy.sh scheduler  # Set up Cloud Scheduler only
 #   ./scripts/gcloud-deploy.sh status     # Show deployment status
 #   ./scripts/gcloud-deploy.sh teardown   # Remove all resources
 #
@@ -29,7 +28,6 @@ set -euo pipefail
 PROJECT_ID="${PROJECT_ID:?Set PROJECT_ID environment variable}"
 REGION="${REGION:-us-central1}"
 REPO_NAME="sec-search"
-BUCKET_NAME="${PROJECT_ID}-sec-search-data"
 SERVICE_ACCOUNT_NAME="sec-search-sa"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
@@ -74,7 +72,6 @@ do_setup() {
         run.googleapis.com \
         artifactregistry.googleapis.com \
         secretmanager.googleapis.com \
-        cloudscheduler.googleapis.com \
         storage.googleapis.com \
         --project="$PROJECT_ID"
 
@@ -88,10 +85,10 @@ do_setup() {
             --display-name="SEC Semantic Search Service Account"
     fi
 
-    # Grant IAM roles to the service account.
+    # Grant IAM roles to the service account. No storage role: the API
+    # keeps its data on an in-memory volume, not in Cloud Storage.
     local roles=(
         "roles/run.invoker"
-        "roles/storage.objectAdmin"
         "roles/secretmanager.secretAccessor"
         "roles/logging.logWriter"
     )
@@ -115,30 +112,6 @@ do_setup() {
             --project="$PROJECT_ID" \
             --description="SEC Semantic Search container images"
     fi
-
-    # Create GCS bucket for persistent data.
-    if gcloud storage buckets describe "gs://${BUCKET_NAME}" --project="$PROJECT_ID" > /dev/null 2>&1; then
-        log "GCS bucket '$BUCKET_NAME' already exists."
-    else
-        log "Creating GCS bucket: $BUCKET_NAME"
-        gcloud storage buckets create "gs://${BUCKET_NAME}" \
-            --project="$PROJECT_ID" \
-            --location="$REGION" \
-            --uniform-bucket-level-access \
-            --public-access-prevention
-    fi
-
-    # Grant bucket access to the service account.
-    log "Granting bucket access to service account..."
-    gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
-        --member="serviceAccount:${SERVICE_ACCOUNT}" \
-        --role="roles/storage.objectAdmin" \
-        --quiet > /dev/null
-
-    # Create initial directory structure in GCS.
-    log "Ensuring data directory structure..."
-    echo -n "" | gcloud storage cp - "gs://${BUCKET_NAME}/chroma_db/.keep" --quiet 2>/dev/null || true
-    echo -n "" | gcloud storage cp - "gs://${BUCKET_NAME}/sqlite/.keep" --quiet 2>/dev/null || true
 
     log "Infrastructure setup complete."
 }
@@ -243,52 +216,11 @@ do_deploy() {
         --update-env-vars="INTERNAL_API_BASE_URL=${API_URL}" \
         --quiet
 
-    # Deploy demo reset job.
-    log "Deploying demo reset job..."
-    sed_replace cloud/demo-reset-job.yaml | \
-        gcloud run jobs replace - \
-            --region="$REGION" \
-            --project="$PROJECT_ID"
-
     log "All services deployed."
     echo ""
     echo "  API:      $API_URL"
     echo "  Frontend: $FRONTEND_URL"
     echo ""
-}
-
-# ── Step 4: Cloud Scheduler ──────────────────────────────────────────
-do_scheduler() {
-    log "=== Setting Up Cloud Scheduler ==="
-
-    SCHEDULER_NAME="sec-search-demo-reset"
-    JOB_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${SCHEDULER_NAME}:run"
-
-    if gcloud scheduler jobs describe "$SCHEDULER_NAME" \
-        --location="$REGION" --project="$PROJECT_ID" > /dev/null 2>&1; then
-        log "Scheduler job '$SCHEDULER_NAME' already exists — updating..."
-        gcloud scheduler jobs update http "$SCHEDULER_NAME" \
-            --location="$REGION" \
-            --project="$PROJECT_ID" \
-            --schedule="0 0 * * *" \
-            --time-zone="UTC" \
-            --uri="$JOB_URI" \
-            --http-method=POST \
-            --oauth-service-account-email="$SERVICE_ACCOUNT"
-    else
-        log "Creating scheduler job: $SCHEDULER_NAME"
-        gcloud scheduler jobs create http "$SCHEDULER_NAME" \
-            --location="$REGION" \
-            --project="$PROJECT_ID" \
-            --schedule="0 0 * * *" \
-            --time-zone="UTC" \
-            --uri="$JOB_URI" \
-            --http-method=POST \
-            --oauth-service-account-email="$SERVICE_ACCOUNT" \
-            --description="Nightly demo data reset for SEC Semantic Search"
-    fi
-
-    log "Cloud Scheduler configured (midnight UTC daily)."
 }
 
 # ── Status ───────────────────────────────────────────────────────────
@@ -303,28 +235,6 @@ do_status() {
         --filter="metadata.labels.app=sec-semantic-search" \
         --format="table(metadata.name, status.url, status.conditions[0].status)" \
         2>/dev/null || echo "  No services found."
-
-    echo ""
-    echo "Jobs:"
-    gcloud run jobs list \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --filter="metadata.labels.app=sec-semantic-search" \
-        --format="table(metadata.name, status.conditions[0].status)" \
-        2>/dev/null || echo "  No jobs found."
-
-    echo ""
-    echo "Scheduler:"
-    gcloud scheduler jobs list \
-        --location="$REGION" \
-        --project="$PROJECT_ID" \
-        --filter="description~'SEC Semantic Search'" \
-        --format="table(name, schedule, state)" \
-        2>/dev/null || echo "  No scheduler jobs found."
-
-    echo ""
-    echo "GCS Bucket:"
-    gcloud storage ls "gs://${BUCKET_NAME}/" 2>/dev/null || echo "  Bucket not found."
 }
 
 # ── Teardown ─────────────────────────────────────────────────────────
@@ -332,7 +242,6 @@ do_teardown() {
     log "=== Teardown ==="
     echo ""
     echo "This will delete ALL Cloud Run resources for SEC Semantic Search."
-    echo "Data in the GCS bucket will NOT be deleted automatically."
     echo ""
     read -rp "Are you sure? (yes/no): " confirm
     if [ "$confirm" != "yes" ]; then
@@ -340,11 +249,11 @@ do_teardown() {
         exit 0
     fi
 
-    log "Deleting Cloud Scheduler job..."
+    # Deployments created before data became ephemeral also have a demo
+    # reset job and scheduler; both deletes are no-ops when absent.
+    log "Deleting legacy demo reset scheduler and job (if present)..."
     gcloud scheduler jobs delete sec-search-demo-reset \
         --location="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-
-    log "Deleting Cloud Run job..."
     gcloud run jobs delete sec-search-demo-reset \
         --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
 
@@ -359,9 +268,9 @@ do_teardown() {
     log "Teardown complete."
     echo ""
     echo "Remaining resources (manual cleanup if needed):"
-    echo "  - GCS bucket: gs://${BUCKET_NAME}"
     echo "  - Artifact Registry: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}"
-    echo "  - Secrets: sec-search-db-encryption-key, sec-search-api-key, sec-search-admin-key"
+    echo "  - Secrets: sec-search-db-encryption-key, sec-search-api-key, sec-search-admin-key, sec-search-hf-token"
+    echo "  - Legacy data bucket, if created by an older version: gs://${PROJECT_ID}-sec-search-data"
     echo "  - Service account: ${SERVICE_ACCOUNT}"
 }
 
@@ -370,7 +279,6 @@ case "${1:-all}" in
     setup)     do_setup ;;
     build)     do_build ;;
     deploy)    do_deploy ;;
-    scheduler) do_scheduler ;;
     status)    do_status ;;
     teardown)  do_teardown ;;
     all)
@@ -380,12 +288,10 @@ case "${1:-all}" in
         echo ""
         do_deploy
         echo ""
-        do_scheduler
-        echo ""
         do_status
         ;;
     *)
-        echo "Usage: $0 {setup|build|deploy|scheduler|status|teardown|all}"
+        echo "Usage: $0 {setup|build|deploy|status|teardown|all}"
         exit 1
         ;;
 esac

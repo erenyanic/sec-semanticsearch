@@ -8,8 +8,10 @@
 # Prerequisites:
 #   1. Artifact Registry repository (see scripts/gcloud-deploy.sh)
 #   2. Secrets in Secret Manager (see scripts/gcloud-setup-secrets.sh)
-#   3. GCS bucket for persistent data
-#   4. Service account with required IAM roles
+#   3. Service account with required IAM roles
+#
+# Data is ephemeral: SQLite and ChromaDB live on an in-memory volume that
+# is discarded when the instance scales to zero or a revision deploys.
 #
 # Requires a CUDA-enabled container image with the embedding model baked
 # in (HF_HUB_OFFLINE=1 below forbids runtime downloads). Build with:
@@ -45,7 +47,7 @@ spec:
   template:
     metadata:
       annotations:
-        # Gen2 execution environment — required for GCS FUSE and GPU.
+        # Gen2 execution environment — required for GPU.
         run.googleapis.com/execution-environment: gen2
 
         # NVIDIA L4 GPU (24 GB VRAM).
@@ -103,7 +105,7 @@ spec:
             - name: API_PORT
               value: "8000"
 
-            # ── Database paths (match GCS FUSE mount) ───────────────
+            # ── Database paths (on the in-memory data volume) ───────
             - name: DB_CHROMA_PATH
               value: /app/data/chroma_db
             - name: DB_METADATA_DB_PATH
@@ -158,8 +160,10 @@ spec:
               value: "30"
 
             # ── Database ────────────────────────────────────────────
+            # Sized to the 8Gi data volume at ~5 MB per filing (ChromaDB
+            # files, SQLite segments and headroom). Raise both together.
             - name: DB_MAX_FILINGS
-              value: "10000"
+              value: "1500"
 
             # ── Rate limiting (requests per minute) ─────────────────
             - name: API_RATE_LIMIT_SEARCH
@@ -203,14 +207,14 @@ spec:
               readOnly: true
 
       volumes:
-        # GCS FUSE — persistent storage for ChromaDB and SQLite.
-        # Single-instance constraint avoids file-locking conflicts.
+        # In-memory volume for ChromaDB and SQLite. Cloud Storage FUSE is
+        # unsuitable for databases (no file locking; random writes rewrite
+        # whole objects), and demo data does not need to outlive the
+        # instance. Counts against the container memory limit above.
         - name: data-volume
-          csi:
-            driver: gcsfuse.run.googleapis.com
-            readOnly: false
-            volumeAttributes:
-              bucketName: PROJECT_ID-sec-search-data
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
 
         # Secret Manager — encryption key mounted as a file.
         - name: db-encryption-key

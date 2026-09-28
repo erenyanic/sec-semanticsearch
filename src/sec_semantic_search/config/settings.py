@@ -219,7 +219,7 @@ class ApiSettings(BaseSettings):
     # Per-session EDGAR credentials requirement.
     edgar_session_required: bool = False
 
-    # Demo mode — FIFO eviction, nightly reset banner, "clear all" disabled.
+    # Demo mode — FIFO eviction, temporary-data banner, "clear all" disabled.
     demo_mode: bool = False
     demo_eviction_buffer: int = 500
 

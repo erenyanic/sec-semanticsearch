@@ -3,7 +3,9 @@
 # demo-reset.sh — Nightly reset script for SEC Semantic Search demo mode.
 #
 # Clears all ingested data (ChromaDB + SQLite) so the demo starts fresh.
-# Designed to be run via cron, Cloud Scheduler, or container entrypoint.
+# Designed to be run via cron, a systemd timer, or container entrypoint on
+# self-hosted (Docker Compose) demo deployments. Cloud Run does not use it:
+# there the data lives on an in-memory volume and is cleared with the instance.
 #
 # Usage:
 #   ./scripts/demo-reset.sh                  # Uses default data paths
@@ -11,7 +13,6 @@
 #
 # Scheduling examples:
 #   cron:            0 0 * * * /path/to/demo-reset.sh >> /var/log/demo-reset.log 2>&1
-#   Cloud Scheduler: gcloud scheduler jobs create http demo-reset ...
 #   Docker:          Add to container entrypoint with crond
 #
 # Environment variables (all optional — defaults match .env.example):

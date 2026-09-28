@@ -22,7 +22,7 @@ export function DemoBanner({ children }: { children: React.ReactNode }) {
           role="status"
           className="border-b border-warn/30 bg-warn/10 px-4 py-2 text-center text-sm font-medium text-warn"
         >
-          Demo mode · Data resets nightly at midnight UTC
+          Demo mode · Data is temporary and may be cleared at any time
         </div>
       )}
       {children}

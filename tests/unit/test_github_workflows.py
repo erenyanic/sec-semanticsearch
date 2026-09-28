@@ -428,7 +428,11 @@ class TestDeployWorkflowJobs:
         runs = _collect_run_blocks(deploy_workflow)
         combined = "\n".join(runs)
         assert "scripts/gcloud-deploy.sh deploy" in combined
-        assert "scripts/gcloud-deploy.sh scheduler" in combined
+
+    def test_no_demo_reset_scheduler(self, deploy_workflow):
+        """Demo data is ephemeral on Cloud Run; there is no reset job to schedule (F-03)."""
+        combined = "\n".join(_collect_run_blocks(deploy_workflow))
+        assert "gcloud-deploy.sh scheduler" not in combined
 
 
 # ── Action version pinning (supply chain) ────────────────────────────

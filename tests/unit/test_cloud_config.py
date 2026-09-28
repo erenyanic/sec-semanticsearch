@@ -38,14 +38,6 @@ def frontend_service():
     return yaml.safe_load(path.read_text())
 
 
-@pytest.fixture
-def demo_reset_job():
-    """Load and parse the demo reset job YAML."""
-    path = CLOUD_DIR / "demo-reset-job.yaml"
-    assert path.exists(), f"{path} not found"
-    return yaml.safe_load(path.read_text())
-
-
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
@@ -192,10 +184,38 @@ class TestApiServiceYaml:
         assert int(env["API_INGEST_COOLDOWN_SECONDS"]) > 0
         assert int(env["API_MAX_TASK_DURATION_MINUTES"]) > 0
 
-    def test_gcs_fuse_volume_defined(self, api_service):
+    def test_data_volume_in_memory(self, api_service):
+        """SQLite and ChromaDB need local-filesystem semantics, not GCS FUSE (F-03)."""
         volumes = api_service["spec"]["template"]["spec"]["volumes"]
         data_vol = next(v for v in volumes if v["name"] == "data-volume")
-        assert data_vol["csi"]["driver"] == "gcsfuse.run.googleapis.com"
+        assert "csi" not in data_vol
+        assert data_vol["emptyDir"]["medium"] == "Memory"
+
+    def test_no_gcs_fuse_volume(self, api_service):
+        for volume in api_service["spec"]["template"]["spec"]["volumes"]:
+            assert volume.get("csi", {}).get("driver") != "gcsfuse.run.googleapis.com"
+
+    def test_data_volume_size_limit_below_memory_limit(self, api_service):
+        """Unbounded, the volume defaults to half the container memory (Cloud Run docs)."""
+        volumes = api_service["spec"]["template"]["spec"]["volumes"]
+        data_vol = next(v for v in volumes if v["name"] == "data-volume")
+        size_gi = int(data_vol["emptyDir"]["sizeLimit"].replace("Gi", ""))
+        container = _get_container(api_service, "api")
+        memory_gi = int(container["resources"]["limits"]["memory"].replace("Gi", ""))
+        assert 0 < size_gi <= memory_gi // 2
+
+    def test_filing_limit_fits_data_volume(self, api_service):
+        """DB_MAX_FILINGS must fit the in-memory volume at ~5 MB per filing.
+
+        The 2026-09-16 audit measured 3.3 MB of ChromaDB files per filing
+        before chunk overlap and the SQLite ``segments`` table; 5 MB leaves
+        room for both. Re-measure after a post-v2 ingest.
+        """
+        volumes = api_service["spec"]["template"]["spec"]["volumes"]
+        data_vol = next(v for v in volumes if v["name"] == "data-volume")
+        size_mb = int(data_vol["emptyDir"]["sizeLimit"].replace("Gi", "")) * 1024
+        env = _get_env_dict(_get_container(api_service, "api"))
+        assert int(env["DB_MAX_FILINGS"]) * 5 <= size_mb
 
     def test_secret_volume_defined(self, api_service):
         volumes = api_service["spec"]["template"]["spec"]["volumes"]
@@ -273,48 +293,39 @@ class TestFrontendServiceYaml:
         assert probe["httpGet"]["port"] == 3000
 
 
-class TestDemoResetJobYaml:
-    """Validate demo reset job YAML structure."""
+class TestEphemeralDemoData:
+    """Demo data lives only as long as the API instance (F-03).
 
-    def test_valid_yaml(self, demo_reset_job):
-        assert demo_reset_job is not None
+    The nightly reset job, its Cloud Scheduler trigger and the GCS bucket
+    existed only to wipe the FUSE-mounted stores. With in-memory storage
+    the data is cleared whenever the instance scales to zero or a new
+    revision deploys, so none of them may come back.
+    """
 
-    def test_kind_is_job(self, demo_reset_job):
-        assert demo_reset_job["kind"] == "Job"
+    def test_reset_job_manifest_removed(self):
+        assert not (CLOUD_DIR / "demo-reset-job.yaml").exists()
 
-    def test_job_name(self, demo_reset_job):
-        assert demo_reset_job["metadata"]["name"] == "sec-search-demo-reset"
+    def test_deploy_script_has_no_bucket_or_scheduler(self):
+        script = (SCRIPTS_DIR / "gcloud-deploy.sh").read_text()
+        assert "gcloud storage buckets create" not in script
+        assert "gcloud scheduler jobs create" not in script
+        assert "demo-reset-job.yaml" not in script
 
-    def test_labels(self, demo_reset_job):
-        labels = demo_reset_job["metadata"]["labels"]
-        assert labels["app"] == "sec-semantic-search"
-        assert labels["component"] == "demo-reset"
+    def test_runtime_account_has_no_storage_role(self):
+        """Least privilege: the API no longer touches Cloud Storage."""
+        script = (SCRIPTS_DIR / "gcloud-deploy.sh").read_text()
+        setup = script.split("do_setup() {", 1)[1].split("\n}", 1)[0]
+        assert "roles/storage" not in setup
 
-    def test_gen2_execution_environment(self, demo_reset_job):
-        """Gen2 required for GCS FUSE volume mount."""
-        annotations = demo_reset_job["spec"]["template"]["metadata"]["annotations"]
-        assert annotations["run.googleapis.com/execution-environment"] == "gen2"
+    def test_entrypoint_creates_data_dirs(self):
+        """The in-memory volume hides the image's /app/data subdirectories."""
+        entrypoint = (PROJECT_ROOT / "docker-entrypoint.sh").read_text()
+        assert "mkdir -p /app/data/chroma_db /app/data/sqlite /app/logs" in entrypoint
+        assert entrypoint.index("mkdir -p /app/data") < entrypoint.index("chown app:app")
 
-    def test_lightweight_container_image(self, demo_reset_job):
-        """Reset job should use a lightweight image, not the full API image."""
-        containers = demo_reset_job["spec"]["template"]["spec"]["template"]["spec"]["containers"]
-        image = containers[0]["image"]
-        assert "alpine" in image
-
-    def test_gcs_fuse_volume(self, demo_reset_job):
-        volumes = demo_reset_job["spec"]["template"]["spec"]["template"]["spec"]["volumes"]
-        data_vol = next(v for v in volumes if v["name"] == "data-volume")
-        assert data_vol["csi"]["driver"] == "gcsfuse.run.googleapis.com"
-
-    def test_max_retries(self, demo_reset_job):
-        max_retries = demo_reset_job["spec"]["template"]["spec"]["template"]["spec"]["maxRetries"]
-        assert max_retries <= 3
-
-    def test_no_gpu_resources(self, demo_reset_job):
-        """Demo reset does not need GPU."""
-        containers = demo_reset_job["spec"]["template"]["spec"]["template"]["spec"]["containers"]
-        limits = containers[0]["resources"]["limits"]
-        assert "nvidia.com/gpu" not in limits
+    def test_demo_banner_does_not_promise_nightly_reset(self):
+        banner = PROJECT_ROOT / "frontend" / "src" / "components" / "layout" / "DemoBanner.tsx"
+        assert "nightly" not in banner.read_text().lower()
 
 
 # ── Cross-service consistency tests ──────────────────────────────────
@@ -332,30 +343,10 @@ class TestServiceConsistency:
         fe_secret = fe_env["ADMIN_API_KEY"]["secretKeyRef"]["name"]
         assert api_secret == fe_secret
 
-    def test_gcs_bucket_matches_between_api_and_job(self, api_service, demo_reset_job):
-        """API and demo reset job must use the same GCS bucket."""
-        api_volumes = api_service["spec"]["template"]["spec"]["volumes"]
-        api_bucket = next(v for v in api_volumes if v["name"] == "data-volume")["csi"][
-            "volumeAttributes"
-        ]["bucketName"]
-
-        job_volumes = demo_reset_job["spec"]["template"]["spec"]["template"]["spec"]["volumes"]
-        job_bucket = next(v for v in job_volumes if v["name"] == "data-volume")["csi"][
-            "volumeAttributes"
-        ]["bucketName"]
-
-        assert api_bucket == job_bucket
-
-    def test_all_services_share_app_label(
-        self,
-        api_service,
-        frontend_service,
-        demo_reset_job,
-    ):
+    def test_all_services_share_app_label(self, api_service, frontend_service):
         """All resources should share the 'sec-semantic-search' app label."""
         assert api_service["metadata"]["labels"]["app"] == "sec-semantic-search"
         assert frontend_service["metadata"]["labels"]["app"] == "sec-semantic-search"
-        assert demo_reset_job["metadata"]["labels"]["app"] == "sec-semantic-search"
 
 
 # ── Placeholder tests ────────────────────────────────────────────────
@@ -368,7 +359,6 @@ class TestPlaceholders:
         params=[
             "cloud/api-service.yaml",
             "cloud/frontend-service.yaml",
-            "cloud/demo-reset-job.yaml",
         ]
     )
     def yaml_content(self, request):

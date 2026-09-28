@@ -12,8 +12,10 @@ set -e
 # This is necessary because Docker initialises named volume directories as root.
 # HF_HOME is the Hugging Face cache (Compose mounts a volume there so a model
 # downloaded at runtime survives container re-creation).
+# A volume mounted at /app/data (Cloud Run's in-memory volume) hides the
+# image's subdirectories, so create them before fixing their ownership.
 HF_CACHE_DIR="${HF_HOME:-/opt/hf}"
-mkdir -p "$HF_CACHE_DIR"
+mkdir -p /app/data/chroma_db /app/data/sqlite /app/logs "$HF_CACHE_DIR"
 chown app:app /app/data/chroma_db /app/data/sqlite /app/logs "$HF_CACHE_DIR"
 
 # Drop to non-root user and exec the application (replaces this shell process).

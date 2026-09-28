@@ -350,8 +350,10 @@ def clear_all(
 
     Requires ``confirm=true`` as a safety measure to prevent accidental
     data loss.  Disabled entirely when ``DEMO_MODE=true`` — returns 403
-    for everyone, including admins.  The nightly reset script handles
-    full cleanup in demo deployments.
+    for everyone, including admins.  Demo data is cleared by the
+    deployment instead: on Cloud Run it lives in an in-memory volume
+    that is discarded with the instance; elsewhere
+    ``scripts/demo-reset.sh`` can run on a schedule.
     """
     if get_settings().api.demo_mode:
         raise HTTPException(
@@ -360,7 +362,7 @@ def clear_all(
                 "error": "demo_mode",
                 "message": "Clear all is disabled in demo mode.",
                 "details": None,
-                "hint": "Data resets nightly at midnight UTC.",
+                "hint": "Demo data is temporary and is cleared automatically.",
             },
         )
 

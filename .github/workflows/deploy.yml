@@ -18,9 +18,9 @@
 #   3. Builds both container images via `gcloud builds submit`, which
 #      runs on Google infrastructure close to Artifact Registry (much
 #      faster than building 6+ GB CUDA images on a GitHub runner).
-#   4. Reuses `scripts/gcloud-deploy.sh deploy` and `scheduler` to
-#      apply the Knative YAML manifests — single source of truth for
-#      placeholder substitution.
+#   4. Reuses `scripts/gcloud-deploy.sh deploy` to apply the Knative
+#      YAML manifests — single source of truth for placeholder
+#      substitution.
 #
 # Required repository secrets:
 #   - GCP_WORKLOAD_IDENTITY_PROVIDER
@@ -288,13 +288,9 @@ jobs:
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
       # Reuse the existing deployment script. It already handles sed
-      # placeholder substitution, CORS/URL wiring between services,
-      # and the Cloud Run Job for demo reset.
+      # placeholder substitution and CORS/URL wiring between services.
       - name: Deploy services
         run: ./scripts/gcloud-deploy.sh deploy
-
-      - name: Configure Cloud Scheduler (demo reset)
-        run: ./scripts/gcloud-deploy.sh scheduler
 
       - name: Show deployment status
         run: ./scripts/gcloud-deploy.sh status
