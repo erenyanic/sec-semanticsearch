@@ -106,7 +106,7 @@ The SEC requires a name and email in the User-Agent header of every EDGAR reques
 
 | Variable               | Default                      | Description                                       |
 | ---------------------- | ---------------------------- | ------------------------------------------------- |
-| `HUGGING_FACE_TOKEN`   | —                            | HF token for faster model downloads               |
+| `HUGGING_FACE_TOKEN`   | —                            | HF token; the default model is gated              |
 | `EMBEDDING_MODEL_NAME` | `google/embeddinggemma-300m` | Sentence-transformer model                        |
 | `EMBEDDING_DEVICE`     | `auto`                       | `cuda`, `cpu`, or `auto`                          |
 | `EMBEDDING_BATCH_SIZE` | `32`                         | Reduce for low-VRAM GPUs (e.g. `8`)               |
@@ -431,6 +431,20 @@ docker compose build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/wh
 ```
 
 To run on CPU instead, comment out the `deploy` block under the `api` service and set `EMBEDDING_DEVICE=cpu`. Note that only `EMBEDDING_DEVICE=auto` falls back to CPU when no GPU is present — an explicit `cuda` is passed straight to the model loader. Embedding on CPU is considerably slower.
+
+### Model weights
+
+By default the API downloads the embedding model on first use, which requires `HUGGING_FACE_TOKEN` because `google/embeddinggemma-300m` is gated. The weights are stored in the `hf_cache` volume, so rebuilding the image or recreating the container does not download them again.
+
+To bake the weights into the image instead, pass the token as a BuildKit secret:
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.api \
+  --build-arg REQUIRE_BAKED_MODEL=1 \
+  --secret id=hf_token,env=HUGGING_FACE_TOKEN .
+```
+
+The secret is mounted for a single build step and is not stored in the image. The Cloud Run build always bakes the weights, and the service runs with `HF_HUB_OFFLINE=1`.
 
 ### TLS
 

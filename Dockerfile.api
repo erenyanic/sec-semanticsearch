@@ -9,6 +9,15 @@
 # image small (~2 GB vs ~8 GB with CUDA).  For GPU acceleration, mount
 # the NVIDIA runtime via `docker compose` (see docker-compose.yml) or
 # build with --build-arg TORCH_INDEX_URL for a CUDA wheel.
+#
+# Model weights: pass a Hugging Face token as a BuildKit secret to bake the
+# embedding model into the image, so no container downloads it at start-up:
+#   docker build -f Dockerfile.api --build-arg REQUIRE_BAKED_MODEL=1 \
+#     --secret id=hf_token,env=HUGGING_FACE_TOKEN .
+# The token is mounted for one RUN step only and never lands in a layer or
+# in `docker history`. Without the secret the model downloads on first use.
+# Always pair the secret with REQUIRE_BAKED_MODEL=1: the build cache does
+# not key on secrets, so a cached no-secret layer would otherwise be reused.
 # ──────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: Builder ─────────────────────────────────────────────────
@@ -47,6 +56,30 @@ COPY README.md ./
 RUN pip install --no-cache-dir --extra-index-url "$TORCH_INDEX_URL" \
         ".[encryption]"
 
+# Bake the embedding model into the Hugging Face cache. Loading it once
+# through sentence-transformers fetches exactly the files the runtime
+# needs; the second load proves they are sufficient with the Hub offline.
+# The deploy pipeline sets REQUIRE_BAKED_MODEL=1 because the Cloud Run
+# manifest runs with HF_HUB_OFFLINE=1 and cannot download at runtime.
+ARG EMBEDDING_MODEL_NAME=google/embeddinggemma-300m
+ARG REQUIRE_BAKED_MODEL=0
+ENV HF_HOME=/opt/hf
+RUN --mount=type=secret,id=hf_token \
+    mkdir -p "$HF_HOME/hub" && \
+    if [ -s /run/secrets/hf_token ]; then \
+        HF_TOKEN="$(cat /run/secrets/hf_token)" python -c \
+            "import sys; from sentence_transformers import SentenceTransformer as M; M(sys.argv[1], device='cpu')" \
+            "$EMBEDDING_MODEL_NAME" && \
+        HF_HUB_OFFLINE=1 python -c \
+            "import sys; from sentence_transformers import SentenceTransformer as M; M(sys.argv[1], device='cpu')" \
+            "$EMBEDDING_MODEL_NAME"; \
+    elif [ "$REQUIRE_BAKED_MODEL" = "1" ]; then \
+        echo "REQUIRE_BAKED_MODEL=1 but no hf_token build secret was supplied." >&2; \
+        exit 1; \
+    else \
+        echo "No hf_token build secret; the model will download on first use."; \
+    fi
+
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────
 FROM python:3.12.13-slim AS runtime
@@ -67,13 +100,22 @@ RUN groupadd --system app && useradd --system --gid app --create-home app
 
 # Application directories — owned by app user
 # chroma_db and sqlite are separate volume mount points (non-overlapping)
-RUN mkdir -p /app/data/chroma_db /app/data/sqlite /app/logs && chown -R app:app /app
+# /opt/hf is the Hugging Face cache; app must be able to write to it when
+# the image was built without the model and downloads it on first use.
+RUN mkdir -p /app/data/chroma_db /app/data/sqlite /app/logs /opt/hf \
+    && chown -R app:app /app /opt/hf
 WORKDIR /app
+
+# Baked model weights (an empty directory when built without the secret).
+# Only hub/ is copied: nothing else under HF_HOME is needed at runtime, and
+# this keeps any token file or hf_xet chunk cache out of the image.
+COPY --from=builder --chown=app:app /opt/hf/hub /opt/hf/hub
 
 # Default data paths (overridable via env vars)
 ENV DB_CHROMA_PATH=/app/data/chroma_db \
     DB_METADATA_DB_PATH=/app/data/sqlite/metadata.sqlite \
     LOG_FILE_PATH="" \
+    HF_HOME=/opt/hf \
     API_HOST=0.0.0.0 \
     API_PORT=8000 \
     PYTHONUNBUFFERED=1

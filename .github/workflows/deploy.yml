@@ -34,6 +34,11 @@
 #   - GCP_PROJECT_ID
 #   - GCP_REGION (e.g. us-central1)
 #
+# Required Secret Manager secret (created by scripts/gcloud-setup-secrets.sh):
+#   - sec-search-hf-token — Hugging Face read token with access to the gated
+#       embedding model. Read by Cloud Build only, to bake the weights into
+#       the API image; the Cloud Run service never sees it.
+#
 # Setup guide: see docs/DEPLOYMENT.md §6.
 # ──────────────────────────────────────────────────────────────────────
 
@@ -168,6 +173,12 @@ jobs:
       # not support `--build-arg` (needed for TORCH_INDEX_URL). The
       # heredoc uses 'EOF' (quoted) so no shell expansion happens inside
       # the file — all substitutions are Cloud Build's own `$_VAR`.
+      #
+      # The Hugging Face token reaches `docker build` as a BuildKit
+      # secret read from the step's environment (`env=HF_TOKEN`); it is
+      # never expanded into the command line, a build arg or a layer.
+      # REQUIRE_BAKED_MODEL=1 fails the build if the secret is missing,
+      # because the Cloud Run manifest runs with HF_HUB_OFFLINE=1.
       - name: Build API image (CUDA) via Cloud Build
         env:
           API_IMAGE: ${{ steps.image-tags.outputs.api_image }}
@@ -175,15 +186,23 @@ jobs:
           cat > /tmp/cloudbuild-api.yaml <<'EOF'
           steps:
             - name: gcr.io/cloud-builders/docker
+              entrypoint: bash
+              env:
+                - DOCKER_BUILDKIT=1
+              secretEnv:
+                - HF_TOKEN
               args:
-                - build
-                - -f
-                - Dockerfile.api
-                - --build-arg
-                - TORCH_INDEX_URL=${_TORCH_INDEX_URL}
-                - -t
-                - ${_IMAGE}
-                - .
+                - -c
+                - >-
+                  docker build -f Dockerfile.api
+                  --build-arg TORCH_INDEX_URL=${_TORCH_INDEX_URL}
+                  --build-arg REQUIRE_BAKED_MODEL=1
+                  --secret id=hf_token,env=HF_TOKEN
+                  -t ${_IMAGE} .
+          availableSecrets:
+            secretManager:
+              - versionName: projects/${PROJECT_ID}/secrets/sec-search-hf-token/versions/latest
+                env: HF_TOKEN
           images:
             - ${_IMAGE}
           options:

@@ -11,9 +11,12 @@
 #   3. GCS bucket for persistent data
 #   4. Service account with required IAM roles
 #
-# Requires a CUDA-enabled container image. Build with:
-#   docker build -f Dockerfile.api \
+# Requires a CUDA-enabled container image with the embedding model baked
+# in (HF_HUB_OFFLINE=1 below forbids runtime downloads). Build with:
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.api \
 #     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 \
+#     --build-arg REQUIRE_BAKED_MODEL=1 \
+#     --secret id=hf_token,env=HUGGING_FACE_TOKEN \
 #     -t REGION-docker.pkg.dev/PROJECT_ID/sec-search/api:latest .
 #
 # CPU-only fallback (no GPU):
@@ -131,6 +134,11 @@ spec:
               value: "64"
             - name: EMBEDDING_IDLE_TIMEOUT_MINUTES
               value: "15"
+            # Weights are baked into the image at build time. Offline mode
+            # stops every cold start from contacting the Hub, and no Hub
+            # token is needed (or present) at runtime.
+            - name: HF_HUB_OFFLINE
+              value: "1"
 
             # ── CORS ────────────────────────────────────────────────
             # Replace after deploying the frontend service.

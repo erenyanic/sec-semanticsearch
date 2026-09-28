@@ -34,6 +34,9 @@ services:
     volumes:
       - chroma_data:/app/data/chroma_db
       - sqlite_data:/app/data/sqlite
+      # Hugging Face cache (HF_HOME). Keeps downloaded model weights across
+      # rebuilds and container re-creation; a baked image seeds it on first use.
+      - hf_cache:/opt/hf
     environment:
       # Database paths (match volume mounts above)
       - DB_CHROMA_PATH=/app/data/chroma_db
@@ -47,7 +50,8 @@ services:
       # EDGAR credentials (Scenario A: set these; Scenario B/C: leave unset)
       - EDGAR_IDENTITY_NAME=${EDGAR_IDENTITY_NAME:-}
       - EDGAR_IDENTITY_EMAIL=${EDGAR_IDENTITY_EMAIL:-}
-      # Hugging Face token (optional, speeds up model download)
+      # Hugging Face token — needed to download the gated model at runtime
+      # unless the image was built with it baked in (see Dockerfile.api).
       - HUGGING_FACE_TOKEN=${HUGGING_FACE_TOKEN:-}
       # Embedding config
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-google/embeddinggemma-300m}
@@ -157,6 +161,8 @@ volumes:
   chroma_data:
     driver: local
   sqlite_data:
+    driver: local
+  hf_cache:
     driver: local
 
 # ── Secrets (optional) ───────────────────────────────────────────────

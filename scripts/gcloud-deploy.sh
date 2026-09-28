@@ -19,6 +19,7 @@
 #   - Docker installed and running
 #   - PROJECT_ID and REGION environment variables set
 #   - Secrets created (see scripts/gcloud-setup-secrets.sh)
+#   - HUGGING_FACE_TOKEN set for the `build` step (bakes the gated model)
 #
 # See docs/DEPLOYMENT.md for full deployment guide.
 # ──────────────────────────────────────────────────────────────────────
@@ -149,11 +150,17 @@ do_build() {
     # Configure Docker for Artifact Registry.
     gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
-    # Build API image (CUDA-enabled for GPU).
-    log "Building API image (CUDA-enabled)..."
-    docker build \
+    # Build API image (CUDA-enabled for GPU) with the embedding model baked
+    # in. The Cloud Run manifest sets HF_HUB_OFFLINE=1, so the build must
+    # have the weights; the token travels as a BuildKit secret only.
+    : "${HUGGING_FACE_TOKEN:?Set HUGGING_FACE_TOKEN to bake the embedding model into the API image}"
+    export HUGGING_FACE_TOKEN
+    log "Building API image (CUDA-enabled, model baked in)..."
+    DOCKER_BUILDKIT=1 docker build \
         -f Dockerfile.api \
         --build-arg TORCH_INDEX_URL="$TORCH_INDEX_URL" \
+        --build-arg REQUIRE_BAKED_MODEL=1 \
+        --secret id=hf_token,env=HUGGING_FACE_TOKEN \
         -t "$API_IMAGE" \
         .
 
