@@ -26,7 +26,8 @@ def mock_model():
     def fake_encode(texts, **kwargs):
         return np.random.default_rng(42).random((len(texts), EMBEDDING_DIMENSION), dtype=np.float32)
 
-    model.encode.side_effect = fake_encode
+    model.encode_document.side_effect = fake_encode
+    model.encode_query.side_effect = fake_encode
     return model
 
 
@@ -242,6 +243,6 @@ class TestErrorWrapping:
                 gen._load_model()
 
     def test_encode_failure(self, generator, mock_model):
-        mock_model.encode.side_effect = RuntimeError("Encoding failed")
+        mock_model.encode_document.side_effect = RuntimeError("Encoding failed")
         with pytest.raises(EmbeddingError, match="Failed to generate embeddings"):
             generator.embed_texts(["test"], show_progress=False)

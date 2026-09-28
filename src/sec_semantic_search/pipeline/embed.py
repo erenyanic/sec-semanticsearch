@@ -274,7 +274,10 @@ class EmbeddingGenerator:
         lock_timeout: float | None = None,
     ) -> np.ndarray:
         """
-        Generate embeddings for a list of texts.
+        Generate document embeddings for a list of texts.
+
+        Texts are encoded as documents, with the model's document prompt
+        (see ``_encode``). Queries go through ``embed_query``.
 
         Only one encode runs at a time. A caller that must not wait
         indefinitely behind another encode or a model load passes
@@ -298,23 +301,49 @@ class EmbeddingGenerator:
                 "No texts to embed",
                 details="Received empty texts list.",
             )
+        return self._embed(texts, show_progress, lock_timeout, query=False)
 
+    def _embed(
+        self,
+        texts: list[str],
+        show_progress: bool,
+        lock_timeout: float | None,
+        *,
+        query: bool,
+    ) -> np.ndarray:
+        """Acquire the model lock (bounded by ``lock_timeout``) and encode."""
         if not self._lock.acquire(timeout=-1 if lock_timeout is None else lock_timeout):
             raise EmbeddingBusyError(
                 "Embedding model is busy",
                 details=f"Not acquired within {lock_timeout:g}s.",
             )
         try:
-            return self._encode(texts, show_progress)
+            return self._encode(texts, show_progress, query=query)
         finally:
             self._lock.release()
 
-    def _encode(self, texts: list[str], show_progress: bool) -> np.ndarray:
-        """Run ``model.encode()``. Caller holds the lock."""
-        try:
-            logger.debug("Embedding %d texts with batch_size=%d", len(texts), self.batch_size)
+    def _encode(self, texts: list[str], show_progress: bool, *, query: bool) -> np.ndarray:
+        """
+        Encode queries or documents. Caller holds the lock.
 
-            embeddings = self.model.encode(
+        Retrieval models such as ``google/embeddinggemma-300m`` are trained
+        with different prompts for queries and documents, declared in the
+        model's sentence-transformers config. ``encode_query`` and
+        ``encode_document`` apply them; for a model without prompts both
+        behave like ``encode``. Changing prompts changes every stored
+        vector, so the index must be rebuilt with the same prompts.
+        """
+        try:
+            logger.debug(
+                "Embedding %d %s with batch_size=%d",
+                len(texts),
+                "queries" if query else "documents",
+                self.batch_size,
+            )
+
+            model = self.model
+            encode = model.encode_query if query else model.encode_document
+            embeddings = encode(
                 texts,
                 batch_size=self.batch_size,
                 show_progress_bar=show_progress,
@@ -393,8 +422,9 @@ class EmbeddingGenerator:
         """
         Generate embedding for a search query.
 
-        This method is optimised for single query embedding during search.
-        It returns a 1D array suitable for ChromaDB query.
+        The query is encoded with the model's query prompt, the counterpart
+        of the document prompt used for chunks. Returns a 1D array suitable
+        for a ChromaDB query.
 
         Args:
             query: Search query text.
@@ -417,9 +447,7 @@ class EmbeddingGenerator:
                 details="Cannot embed empty or whitespace-only query.",
             )
 
-        logger.debug("Embedding query: %s...", query[:50])
-
-        embeddings = self.embed_texts([query], show_progress=False, lock_timeout=lock_timeout)
+        embeddings = self._embed([query], False, lock_timeout, query=True)
 
         # Return as 1D array
         return embeddings[0]

@@ -27,7 +27,8 @@ def _vectors(texts, **kwargs):
 def generator():
     gen = EmbeddingGenerator()
     gen._model = MagicMock()
-    gen._model.encode.side_effect = _vectors
+    gen._model.encode_query.side_effect = _vectors
+    gen._model.encode_document.side_effect = _vectors
     return gen
 
 
@@ -83,16 +84,22 @@ class TestSerializedEncode:
                 active -= 1
             return _vectors(texts)
 
-        generator._model.encode.side_effect = tracking_encode
+        generator._model.encode_query.side_effect = tracking_encode
+        generator._model.encode_document.side_effect = tracking_encode
+        # Searches (queries) and an ingest (documents) share one lock.
         threads = [
-            threading.Thread(target=generator.embed_query, args=(f"q{i}",)) for i in range(8)
+            threading.Thread(target=generator.embed_query, args=(f"q{i}",)) for i in range(4)
+        ] + [
+            threading.Thread(target=generator.embed_texts, args=([f"d{i}"], False))
+            for i in range(4)
         ]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=5)
 
-        assert generator._model.encode.call_count == 8
+        assert generator._model.encode_query.call_count == 4
+        assert generator._model.encode_document.call_count == 4
         assert peak == 1
 
     def test_unload_waits_for_in_flight_encode(self, generator):
@@ -104,7 +111,7 @@ class TestSerializedEncode:
             release.wait(timeout=5)
             return _vectors(texts)
 
-        generator._model.encode.side_effect = blocking_encode
+        generator._model.encode_query.side_effect = blocking_encode
         encoder = threading.Thread(target=generator.embed_query, args=("q",))
         encoder.start()
         assert encoding.wait(timeout=5)
@@ -134,7 +141,8 @@ class TestBoundedWait:
             release.set()
             holder.join(timeout=5)
 
-        generator._model.encode.assert_not_called()
+        generator._model.encode_query.assert_not_called()
+        generator._model.encode_document.assert_not_called()
 
     def test_busy_error_is_an_embedding_error(self):
         assert issubclass(EmbeddingBusyError, EmbeddingError)
@@ -165,11 +173,11 @@ class TestBoundedWait:
         assert result and result[0].shape == (EMBEDDING_DIMENSION,)
 
     def test_lock_released_after_encode_failure(self, generator):
-        generator._model.encode.side_effect = RuntimeError("CUDA OOM")
+        generator._model.encode_query.side_effect = RuntimeError("CUDA OOM")
         with pytest.raises(EmbeddingError):
             generator.embed_query("q")
 
-        generator._model.encode.side_effect = _vectors
+        generator._model.encode_query.side_effect = _vectors
         assert generator.embed_query("q", lock_timeout=0.05).shape == (EMBEDDING_DIMENSION,)
 
 
