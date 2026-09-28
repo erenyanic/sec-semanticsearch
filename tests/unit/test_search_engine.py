@@ -13,7 +13,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from sec_semantic_search.core.exceptions import EmbeddingError, SearchError
+from sec_semantic_search.core.exceptions import (
+    EmbeddingBusyError,
+    EmbeddingError,
+    SearchError,
+)
 from sec_semantic_search.core.types import ContentType, SearchResult
 from sec_semantic_search.search.engine import SearchEngine
 
@@ -57,6 +61,26 @@ class TestExceptionWrapping:
         mock_chroma.query.side_effect = DatabaseError("connection lost")
         with pytest.raises(SearchError, match="Search failed"):
             engine.search("test query")
+
+
+class TestEmbedTimeout:
+    """The API's bounded wait reaches the embedder; a busy model is not flattened."""
+
+    def test_timeout_forwarded_to_embedder(self, engine, mock_embedder):
+        engine.search("test query", embed_timeout=12.5)
+        _, kwargs = mock_embedder.embed_query_for_chromadb.call_args
+        assert kwargs["lock_timeout"] == 12.5
+
+    def test_default_waits_without_limit(self, engine, mock_embedder):
+        engine.search("test query")
+        _, kwargs = mock_embedder.embed_query_for_chromadb.call_args
+        assert kwargs["lock_timeout"] is None
+
+    def test_busy_error_propagates_unwrapped(self, engine, mock_embedder):
+        """The route maps this type to 503; wrapping it in SearchError would make it a 500."""
+        mock_embedder.embed_query_for_chromadb.side_effect = EmbeddingBusyError("busy")
+        with pytest.raises(EmbeddingBusyError):
+            engine.search("test query", embed_timeout=0.1)
 
 
 class TestAccessionNumberFilter:

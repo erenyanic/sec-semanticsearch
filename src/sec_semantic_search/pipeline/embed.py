@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from sec_semantic_search.config import EMBEDDING_DIMENSION, get_settings
-from sec_semantic_search.core import Chunk, EmbeddingError, get_logger
+from sec_semantic_search.core import Chunk, EmbeddingBusyError, EmbeddingError, get_logger
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
@@ -76,9 +76,17 @@ class EmbeddingGenerator:
         # Model loaded lazily
         self._model: SentenceTransformer | None = None
 
+        # Serializes load, unload and encode. API searches run in worker
+        # threads and can overlap each other and an ingest; fast tokenizers
+        # are not safe for concurrent use, and unload() must never free the
+        # model under an in-flight encode. Re-entrant because embed_texts()
+        # holds it while reading ``self.model``.
+        self._lock = threading.RLock()
+
         # Idle timeout — auto-unload model after inactivity.
         self._idle_timeout_seconds: float = settings.embedding.idle_timeout_minutes * 60.0
         self._idle_timer: threading.Timer | None = None
+        self._idle_generation = 0
 
         logger.debug(
             "EmbeddingGenerator configured: model=%s, device=%s, batch_size=%d",
@@ -129,10 +137,11 @@ class EmbeddingGenerator:
         Raises:
             EmbeddingError: If model loading fails.
         """
-        if self._model is None:
-            self._model = self._load_model()
-        self._schedule_idle_timer()
-        return self._model
+        with self._lock:
+            if self._model is None:
+                self._model = self._load_model()
+            self._schedule_idle_timer()
+            return self._model
 
     def unload(self) -> None:
         """
@@ -140,33 +149,39 @@ class EmbeddingGenerator:
 
         Idempotent — safe to call when the model is not loaded.
         The model will reload automatically on the next access via
-        the ``model`` property.
+        the ``model`` property. Blocks until any in-flight encode finishes.
         """
-        self._cancel_idle_timer()
+        with self._lock:
+            self._cancel_idle_timer()
 
-        if self._model is None:
-            logger.debug("Model already unloaded — nothing to do.")
-            return
+            if self._model is None:
+                logger.debug("Model already unloaded — nothing to do.")
+                return
 
-        device = self.device
-        del self._model
-        self._model = None
+            device = self.device
+            del self._model
+            self._model = None
 
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
-        logger.info("Embedding model unloaded (device was %s).", device)
+            logger.info("Embedding model unloaded (device was %s).", device)
 
     # ------------------------------------------------------------------
     # Idle timer
     # ------------------------------------------------------------------
 
     def _schedule_idle_timer(self) -> None:
-        """Reset the idle timer if a timeout is configured."""
+        """Reset the idle timer if a timeout is configured. Caller holds the lock."""
         if self._idle_timeout_seconds <= 0:
             return
         self._cancel_idle_timer()
-        self._idle_timer = threading.Timer(self._idle_timeout_seconds, self._on_idle_timeout)
+        self._idle_generation += 1
+        self._idle_timer = threading.Timer(
+            self._idle_timeout_seconds,
+            self._on_idle_timeout,
+            args=(self._idle_generation,),
+        )
         self._idle_timer.daemon = True
         self._idle_timer.start()
 
@@ -176,13 +191,18 @@ class EmbeddingGenerator:
             self._idle_timer.cancel()
             self._idle_timer = None
 
-    def _on_idle_timeout(self) -> None:
+    def _on_idle_timeout(self, generation: int) -> None:
         """Called when the idle timer fires."""
-        logger.info(
-            "Embedding model idle for %d minute(s) — auto-unloading.",
-            int(self._idle_timeout_seconds / 60),
-        )
-        self.unload()
+        with self._lock:
+            # A timer that fired while an encode held the lock is stale: that
+            # encode re-armed a newer timer, so the model is not idle.
+            if generation != self._idle_generation:
+                return
+            logger.info(
+                "Embedding model idle for %d minute(s) — auto-unloading.",
+                int(self._idle_timeout_seconds / 60),
+            )
+            self.unload()
 
     def _load_model(self) -> "SentenceTransformer":
         """
@@ -250,18 +270,27 @@ class EmbeddingGenerator:
         self,
         texts: list[str],
         show_progress: bool = True,
+        *,
+        lock_timeout: float | None = None,
     ) -> np.ndarray:
         """
         Generate embeddings for a list of texts.
 
+        Only one encode runs at a time. A caller that must not wait
+        indefinitely behind another encode or a model load passes
+        ``lock_timeout``.
+
         Args:
             texts: List of text strings to embed.
             show_progress: Whether to show progress bar.
+            lock_timeout: Seconds to wait for the model. ``None`` waits
+                without limit (CLI and ingest).
 
         Returns:
             NumPy array of shape (n_texts, embedding_dim).
 
         Raises:
+            EmbeddingBusyError: If ``lock_timeout`` elapses first.
             EmbeddingError: If embedding generation fails.
         """
         if not texts:
@@ -270,6 +299,18 @@ class EmbeddingGenerator:
                 details="Received empty texts list.",
             )
 
+        if not self._lock.acquire(timeout=-1 if lock_timeout is None else lock_timeout):
+            raise EmbeddingBusyError(
+                "Embedding model is busy",
+                details=f"Not acquired within {lock_timeout:g}s.",
+            )
+        try:
+            return self._encode(texts, show_progress)
+        finally:
+            self._lock.release()
+
+    def _encode(self, texts: list[str], show_progress: bool) -> np.ndarray:
+        """Run ``model.encode()``. Caller holds the lock."""
         try:
             logger.debug("Embedding %d texts with batch_size=%d", len(texts), self.batch_size)
 
@@ -348,7 +389,7 @@ class EmbeddingGenerator:
 
         return embeddings
 
-    def embed_query(self, query: str) -> np.ndarray:
+    def embed_query(self, query: str, *, lock_timeout: float | None = None) -> np.ndarray:
         """
         Generate embedding for a search query.
 
@@ -357,11 +398,13 @@ class EmbeddingGenerator:
 
         Args:
             query: Search query text.
+            lock_timeout: Seconds to wait for the model; see ``embed_texts``.
 
         Returns:
             NumPy array of shape (embedding_dim,).
 
         Raises:
+            EmbeddingBusyError: If ``lock_timeout`` elapses first.
             EmbeddingError: If query is empty or embedding fails.
 
         Example:
@@ -376,12 +419,17 @@ class EmbeddingGenerator:
 
         logger.debug("Embedding query: %s...", query[:50])
 
-        embeddings = self.embed_texts([query], show_progress=False)
+        embeddings = self.embed_texts([query], show_progress=False, lock_timeout=lock_timeout)
 
         # Return as 1D array
         return embeddings[0]
 
-    def embed_query_for_chromadb(self, query: str) -> list[list[float]]:
+    def embed_query_for_chromadb(
+        self,
+        query: str,
+        *,
+        lock_timeout: float | None = None,
+    ) -> list[list[float]]:
         """
         Generate embedding in ChromaDB query format.
 
@@ -390,9 +438,10 @@ class EmbeddingGenerator:
 
         Args:
             query: Search query text.
+            lock_timeout: Seconds to wait for the model; see ``embed_texts``.
 
         Returns:
             List containing single embedding as list of floats.
         """
-        embedding = self.embed_query(query)
+        embedding = self.embed_query(query, lock_timeout=lock_timeout)
         return [embedding.tolist()]

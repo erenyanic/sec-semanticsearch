@@ -17,21 +17,33 @@ from sec_semantic_search.api.schemas import (
     SearchResponse,
     SearchResultSchema,
 )
-from sec_semantic_search.core import SearchError, get_logger, redact_for_log
+from sec_semantic_search.core import EmbeddingBusyError, SearchError, get_logger, redact_for_log
 from sec_semantic_search.search import SearchEngine
 
 logger = get_logger(__name__)
 
 router = APIRouter()
 
+# How long a search waits for the embedding model while an ingest batch or
+# a model load holds it. Past this the caller gets a retryable 503 instead
+# of pinning a threadpool worker for the length of a whole filing's encode.
+_EMBED_WAIT_SECONDS = 30.0
 
+
+# Plain ``def``: FastAPI runs it in the threadpool. Embedding, the ChromaDB
+# query and the SQLite join all block, and on the event loop they would
+# stall health probes and WebSocket delivery for the length of the search.
 @router.post(
     "/",
     response_model=SearchResponse,
-    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    responses={
+        400: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
     summary="Semantic search over filings",
 )
-async def search(
+def search(
     body: SearchRequest,
     engine: SearchEngine = Depends(get_search_engine),
 ) -> SearchResponse:
@@ -57,7 +69,20 @@ async def search(
             accession_number=body.accession_number,
             start_date=body.start_date,
             end_date=body.end_date,
+            embed_timeout=_EMBED_WAIT_SECONDS,
         )
+    except EmbeddingBusyError as exc:
+        logger.warning("Search rejected: %s", exc.details)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "model_busy",
+                "message": "The embedding model is busy. Try again shortly.",
+                "details": None,
+                "hint": "An ingest or model load is in progress.",
+            },
+            headers={"Retry-After": "5"},
+        ) from exc
     except SearchError as exc:
         # Empty query is a validation error (400); everything else is 500.
         if "empty" in exc.message.lower():

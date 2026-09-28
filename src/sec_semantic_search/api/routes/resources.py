@@ -4,6 +4,10 @@ GPU resource management endpoints.
 Provides ``GET /api/resources/gpu`` to check model status and
 ``DELETE /api/resources/gpu`` to explicitly unload the embedding
 model and free VRAM.
+
+``gpu_status`` stays async: it reads flags and never touches the model.
+``gpu_unload`` is plain ``def`` because unloading waits for any in-flight
+encode to release the embedder lock.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -48,7 +52,7 @@ async def gpu_status(
     summary="Unload embedding model",
     dependencies=[Depends(verify_admin_key)],
 )
-async def gpu_unload(
+def gpu_unload(
     request: Request,
     embedder: EmbeddingGenerator = Depends(get_embedder),
     task_manager: TaskManager = Depends(get_task_manager),

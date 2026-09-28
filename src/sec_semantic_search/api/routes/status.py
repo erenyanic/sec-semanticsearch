@@ -4,6 +4,9 @@ Status endpoint — database overview and statistics.
 Provides ``GET /api/status/`` returning filing count, chunk count,
 per-ticker and per-form breakdowns.  Mirrors the CLI ``manage status``
 command output.
+
+The handler is plain ``def``: the registry statistics query and the ChromaDB
+count block, so FastAPI runs it in the threadpool rather than on the event loop.
 """
 
 from fastapi import APIRouter, Depends, Request
@@ -21,7 +24,7 @@ router = APIRouter()
     response_model=StatusResponse,
     summary="Database overview",
 )
-async def status(
+def status(
     request: Request,
     registry: MetadataRegistry = Depends(get_registry),
     chroma: ChromaDBClient = Depends(get_chroma),

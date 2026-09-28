@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from sec_semantic_search.api.app import app
 from sec_semantic_search.api.dependencies import get_search_engine
-from sec_semantic_search.core.exceptions import SearchError
+from sec_semantic_search.core.exceptions import EmbeddingBusyError, SearchError
 from sec_semantic_search.core.types import ContentType, SearchResult
 
 
@@ -119,6 +119,24 @@ class TestSearchEndpoint:
         resp = client.post("/api/search/", json={"query": "x"})
         assert resp.status_code == 500
         assert resp.json()["detail"]["error"] == "search_error"
+
+    def test_model_busy_returns_503(self):
+        """A search that cannot get the embedder in time fails fast and retryably."""
+        client, _ = _make_client(search_error=EmbeddingBusyError("Embedding model is busy"))
+        resp = client.post("/api/search/", json={"query": "test"})
+        assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "5"
+        detail = resp.json()["detail"]
+        assert detail["error"] == "model_busy"
+        assert detail["details"] is None
+
+    def test_embed_wait_is_bounded(self):
+        """The route never lets a search wait on the embedder without limit."""
+        client, engine = _make_client()
+        client.post("/api/search/", json={"query": "test"})
+        _, kwargs = engine.search.call_args
+        assert kwargs["embed_timeout"] is not None
+        assert 0 < kwargs["embed_timeout"] <= 60
 
     def test_ticker_filter_passed(self):
         """Single-string ticker is coerced to a one-element list."""

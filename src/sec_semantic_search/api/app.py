@@ -19,9 +19,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from sec_semantic_search import __version__
@@ -90,28 +90,28 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
-class InsecureTransportWarningMiddleware(BaseHTTPMiddleware):
-    """Log a one-time warning when protected traffic arrives over HTTP."""
+class InsecureTransportWarningMiddleware:
+    """Log a one-time warning when protected traffic arrives over HTTP.
+
+    Pure ASGI implementation — reads headers from the scope and never
+    wraps the response, unlike ``BaseHTTPMiddleware``.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
+        self.app = app
         self._warned = False
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: RequestResponseEndpoint,
-    ) -> Response:
-        if not self._warned:
-            self._maybe_warn(request)
-        return await call_next(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and not self._warned:
+            self._maybe_warn(Headers(scope=scope))
+        await self.app(scope, receive, send)
 
-    def _maybe_warn(self, request: Request) -> None:
+    def _maybe_warn(self, headers: Headers) -> None:
         settings = get_settings()
         if not (settings.api.key or settings.api.admin_key or settings.api.edgar_session_required):
             return
 
-        forwarded_proto = request.headers.get("x-forwarded-proto")
+        forwarded_proto = headers.get("x-forwarded-proto")
         if forwarded_proto is None:
             return
 

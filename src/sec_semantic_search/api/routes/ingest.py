@@ -11,6 +11,10 @@ Provides five routes:
 All business logic lives in ``tasks.TaskManager``; these routes are a
 thin HTTP layer that validates input, delegates to the manager, and
 converts internal dataclasses into Pydantic response schemas.
+
+``get_task`` and ``cancel_task`` are plain ``def``: a task pruned from memory
+is looked up in SQLite task history, which blocks. The rest only touch
+in-memory state and stay async.
 """
 
 from __future__ import annotations
@@ -336,7 +340,7 @@ async def list_tasks(
     responses={404: {"model": ErrorResponse}},
     summary="Get ingestion task status",
 )
-async def get_task(
+def get_task(
     task_id: str,
     manager: TaskManager = Depends(get_task_manager),
 ) -> TaskStatus:
@@ -369,7 +373,7 @@ async def get_task(
     },
     summary="Cancel a running ingestion task",
 )
-async def cancel_task(
+def cancel_task(
     request: Request,
     task_id: str,
     manager: TaskManager = Depends(get_task_manager),

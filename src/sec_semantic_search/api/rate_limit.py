@@ -8,7 +8,8 @@ that tracks request timestamps per client IP.
 Design choices:
     - **No external dependency** — pure Python with ``threading.Lock``
       for thread safety.  Appropriate for a single-process application.
-    - **Per-IP tracking** — uses ``request.client.host`` as the key.
+    - **Per-IP tracking** — uses the ASGI ``client`` host as the key
+      (the real client IP once uvicorn's ``--proxy-headers`` rewrites it).
     - **Category-based limits** — different limits for search (GPU),
       ingest (GPU), delete (destructive), and general endpoints.
     - **Automatic cleanup** — stale entries are pruned periodically
@@ -30,9 +31,8 @@ import threading
 import time
 from collections import defaultdict, deque
 
-from fastapi import Request, Response
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from sec_semantic_search.core import get_logger
 
@@ -128,16 +128,20 @@ def _classify_path(path: str, method: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
+class RateLimitMiddleware:
     """Per-IP sliding-window rate limiter.
 
     Parameters correspond to requests-per-minute for each category.
     A value of ``0`` disables limiting for that category.
+
+    Pure ASGI implementation — reads path, method and client straight
+    from the scope, avoiding the per-request response wrapping of
+    ``BaseHTTPMiddleware``. WebSocket and lifespan scopes pass through.
     """
 
     def __init__(
         self,
-        app,
+        app: ASGIApp,
         *,
         search_rpm: int = 30,
         ingest_rpm: int = 5,
@@ -145,7 +149,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         general_rpm: int = 60,
         auth_rpm: int = 5,
     ) -> None:
-        super().__init__(app)
+        self.app = app
         self._buckets: dict[str, _SlidingWindow] = {}
         for category, rpm in [
             ("search", search_rpm),
@@ -162,18 +166,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         for bucket in self._buckets.values():
             bucket.reset()
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: RequestResponseEndpoint,
-    ) -> Response:
-        category = _classify_path(request.url.path, request.method)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path: str = scope["path"]
+        method: str = scope["method"]
+        category = _classify_path(path, method)
 
         if category is None or category not in self._buckets:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         bucket = self._buckets[category]
-        client_ip = request.client.host if request.client else "unknown"
+        client = scope.get("client")
+        client_ip = client[0] if client else "unknown"
 
         allowed, retry_after = bucket.is_allowed(client_ip)
         if not allowed:
@@ -181,11 +189,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 "Rate limit exceeded: %s from %s on %s %s (limit: %d/min)",
                 category,
                 client_ip,
-                request.method,
-                request.url.path,
+                method,
+                path,
                 bucket.limit,
             )
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=429,
                 content={
                     "detail": {
@@ -197,5 +205,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 },
                 headers={"Retry-After": str(retry_after)},
             )
+            await response(scope, receive, send)
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)

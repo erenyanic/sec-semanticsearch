@@ -28,6 +28,7 @@ import asyncio
 import hmac
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.concurrency import run_in_threadpool
 
 from sec_semantic_search.api.tasks import TaskInfo, TaskState
 from sec_semantic_search.config import get_settings
@@ -96,9 +97,10 @@ async def ingest_progress(websocket: WebSocket, task_id: str) -> None:
     if not await _authenticate_websocket(websocket):
         return
 
-    # Retrieve the TaskManager from app state.
+    # Retrieve the TaskManager from app state. A task pruned from memory is
+    # read back from SQLite task history, so keep the lookup off the loop.
     task_manager = websocket.app.state.task_manager
-    info = task_manager.get_task(task_id)
+    info = await run_in_threadpool(task_manager.get_task, task_id)
 
     if info is None:
         await websocket.send_json(

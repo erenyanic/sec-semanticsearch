@@ -11,6 +11,7 @@ Exception hierarchy:
     ├── ParseError — HTML parsing failures (doc2dict)
     ├── ChunkingError — Text chunking failures
     ├── EmbeddingError — Embedding generation failures
+    │   └── EmbeddingBusyError — Model held by another caller past the wait bound
     ├── DatabaseError — ChromaDB or SQLite failures
     │   └── FilingLimitExceededError — Maximum filing count reached
     └── SearchError — Search operation failures
@@ -97,6 +98,19 @@ class EmbeddingError(SECSemanticSearchError):
         - Model loading failures
         - GPU memory exhaustion
         - Invalid input to embedding model
+    """
+
+    pass
+
+
+class EmbeddingBusyError(EmbeddingError):
+    """
+    Raised when the embedding model could not be acquired in time.
+
+    Only callers that pass a ``lock_timeout`` to ``EmbeddingGenerator``
+    can see this. The API maps it to ``503 Service Unavailable`` so a
+    search queued behind an ingest batch or a model load fails fast and
+    retryably instead of holding a worker thread indefinitely.
     """
 
     pass

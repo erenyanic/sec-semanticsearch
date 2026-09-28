@@ -13,7 +13,7 @@ Usage:
 """
 
 from sec_semantic_search.config import get_settings
-from sec_semantic_search.core import SearchError, SearchResult, get_logger
+from sec_semantic_search.core import EmbeddingBusyError, SearchError, SearchResult, get_logger
 from sec_semantic_search.database import ChromaDBClient, MetadataRegistry
 from sec_semantic_search.pipeline import EmbeddingGenerator
 
@@ -86,6 +86,7 @@ class SearchEngine:
         accession_number: str | list[str] | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        embed_timeout: float | None = None,
     ) -> list[SearchResult]:
         """
         Search ingested filings for chunks relevant to the query.
@@ -110,12 +111,16 @@ class SearchEngine:
                 ``YYYY-MM-DD``).
             end_date: Optional upper bound for filing date (inclusive,
                 ``YYYY-MM-DD``).
+            embed_timeout: Seconds to wait for the embedding model when
+                another encode or a model load holds it. ``None`` waits
+                without limit.
 
         Returns:
             List of ``SearchResult`` objects ordered by similarity
             (highest first), filtered by the minimum similarity threshold.
 
         Raises:
+            EmbeddingBusyError: If ``embed_timeout`` elapses first.
             SearchError: If the query is empty or the search operation fails.
         """
         if not query or not query.strip():
@@ -139,7 +144,9 @@ class SearchEngine:
         )
 
         try:
-            query_embeddings = self._embedder.embed_query_for_chromadb(query)
+            query_embeddings = self._embedder.embed_query_for_chromadb(
+                query, lock_timeout=embed_timeout
+            )
 
             results = self._chroma_client.query(
                 query_embeddings=query_embeddings,
@@ -150,7 +157,7 @@ class SearchEngine:
                 start_date=start_date,
                 end_date=end_date,
             )
-        except SearchError:
+        except (SearchError, EmbeddingBusyError):
             raise
         except Exception as e:
             raise SearchError(

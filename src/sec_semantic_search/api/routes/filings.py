@@ -7,6 +7,10 @@ Provides full CRUD (minus create — that's ingest) for the filing registry:
     - ``DELETE /api/filings/{accession}`` — delete a single filing (ChromaDB first, then SQLite)
     - ``POST   /api/filings/bulk-delete`` — bulk delete by ticker/form_type filter
     - ``DELETE /api/filings/``            — clear all filings (requires ``confirm=true``)
+
+Every handler is plain ``def`` so FastAPI runs it in the threadpool. SQLite
+reads and ChromaDB deletes block; on the event loop they would stall health
+probes, WebSocket delivery and every other request.
 """
 
 from typing import Literal
@@ -57,7 +61,7 @@ def _record_to_schema(record: FilingRecord) -> FilingSchema:
     response_model=FilingListResponse,
     summary="List ingested filings",
 )
-async def list_filings(
+def list_filings(
     registry: MetadataRegistry = Depends(get_registry),
     ticker: str | None = Query(None, description="Filter by ticker symbol"),
     form_type: str | None = Query(None, description="Filter by form type (8-K, 10-K, or 10-Q)"),
@@ -94,7 +98,7 @@ async def list_filings(
     responses={404: {"model": ErrorResponse}},
     summary="Get a single filing",
 )
-async def get_filing(
+def get_filing(
     accession: str = Path(..., max_length=20, pattern=r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$"),
     registry: MetadataRegistry = Depends(get_registry),
 ) -> FilingSchema:
@@ -127,7 +131,7 @@ async def get_filing(
     responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
     summary="Delete a single filing",
 )
-async def delete_filing(
+def delete_filing(
     request: Request,
     accession: str = Path(..., max_length=20, pattern=r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$"),
     registry: MetadataRegistry = Depends(get_registry),
@@ -184,7 +188,7 @@ async def delete_filing(
     responses={500: {"model": ErrorResponse}},
     summary="Delete filings by accession numbers",
 )
-async def delete_by_ids(
+def delete_by_ids(
     request: Request,
     body: DeleteByIdsRequest,
     registry: MetadataRegistry = Depends(get_registry),
@@ -253,7 +257,7 @@ async def delete_by_ids(
     summary="Bulk delete filings by filter",
     dependencies=[Depends(verify_admin_key)],
 )
-async def bulk_delete(
+def bulk_delete(
     request: Request,
     body: BulkDeleteRequest,
     registry: MetadataRegistry = Depends(get_registry),
@@ -335,7 +339,7 @@ async def bulk_delete(
     summary="Clear all filings",
     dependencies=[Depends(verify_admin_key)],
 )
-async def clear_all(
+def clear_all(
     request: Request,
     confirm: bool = Query(False, description="Safety flag — must be true to proceed"),
     registry: MetadataRegistry = Depends(get_registry),
