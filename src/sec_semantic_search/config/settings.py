@@ -60,6 +60,20 @@ class ChunkingSettings(BaseSettings):
             raise ValueError("CHUNKING_OVERLAP must be ≥ 0.")
         return value
 
+    @model_validator(mode="after")
+    def _validate_proportions(self) -> "ChunkingSettings":
+        # Out of proportion, these turn nearly every sentence into a chunk
+        # boundary and multiply embedding work and storage per filing.
+        if self.token_limit < 1:
+            raise ValueError("CHUNKING_TOKEN_LIMIT must be ≥ 1.")
+        if not 0 <= self.tolerance < self.token_limit:
+            raise ValueError(
+                "CHUNKING_TOLERANCE must be ≥ 0 and smaller than CHUNKING_TOKEN_LIMIT."
+            )
+        if self.overlap > self.token_limit // 2:
+            raise ValueError("CHUNKING_OVERLAP must be at most half of CHUNKING_TOKEN_LIMIT.")
+        return self
+
 
 def resolve_encryption_key_from_values(key: str | None, key_file: str | None) -> str | None:
     """Resolve an encryption key from a direct value or file path.

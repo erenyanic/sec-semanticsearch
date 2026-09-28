@@ -12,11 +12,20 @@ Usage:
 """
 
 import re
+from typing import NamedTuple
 
 from sec_semantic_search.config import get_settings
 from sec_semantic_search.core import Chunk, ChunkingError, Segment, get_logger
 
 logger = get_logger(__name__)
+
+
+class _Unit(NamedTuple):
+    """A sentence (or fallback piece) and the whitespace that preceded it."""
+
+    sep: str
+    text: str
+    tokens: int
 
 
 class TextChunker:
@@ -28,15 +37,23 @@ class TextChunker:
 
     The chunking algorithm:
         1. If segment fits within token limit, keep as-is
-        2. Otherwise, split on sentence boundaries (. ! ?)
+        2. Otherwise, split on sentence boundaries (. ! ?). A "sentence" longer
+           than ``token_limit + tolerance`` has no boundary to split on — in
+           practice a table, whose rows are joined by line breaks — so it is
+           split on line breaks instead, and any row still over the cap into
+           windows of ``token_limit`` words.
         3. Accumulate sentences targeting ``token_limit ± tolerance`` — finalise
            early once the running chunk has reached ``token_limit - tolerance``,
            and never overflow past ``token_limit + tolerance``.
         4. Seed each subsequent chunk with trailing whole sentences from the
            previous one, up to the configured overlap budget. If even the last
            sentence exceeds the budget, that single sentence is reused whole
-           (sentence-boundary invariant preserved — chunks never start
-           mid-sentence).
+           (chunks never start mid-sentence) — unless it would push the new
+           chunk past ``token_limit + tolerance``, in which case it is dropped.
+
+    No chunk exceeds ``token_limit + tolerance``. Chunks keep the original
+    whitespace between sentences, so each chunk is an exact substring of its
+    segment and the UI can highlight it inside the parent text.
 
     Attributes:
         token_limit: Maximum tokens per chunk (from settings)
@@ -51,6 +68,12 @@ class TextChunker:
 
     # Sentence boundary pattern: split after . ! ? followed by whitespace
     SENTENCE_PATTERN = re.compile(r"(?<=[.!?])\s+")
+
+    # The same boundaries captured, and the fallback boundaries for an
+    # over-long sentence: line breaks (table rows), then words.
+    _SENTENCE_SPLIT = re.compile(r"((?<=[.!?])\s+)")
+    _LINE_SPLIT = re.compile(r"(\s*\n\s*)")
+    _WORD = re.compile(r"\S+")
 
     def __init__(
         self,
@@ -72,11 +95,18 @@ class TextChunker:
         self.tolerance = tolerance if tolerance is not None else settings.chunking.tolerance
         self.overlap = overlap if overlap is not None else settings.chunking.overlap
 
+        if not 0 <= self.tolerance < self.token_limit:
+            raise ValueError(
+                f"tolerance ({self.tolerance}) must be ≥ 0 and smaller than "
+                f"token_limit ({self.token_limit})"
+            )
         if self.overlap < 0:
             raise ValueError("overlap must be ≥ 0")
-        if self.overlap >= self.token_limit:
+        # A larger overlap turns nearly every sentence into a chunk boundary
+        # and multiplies embedding work and storage per filing.
+        if self.overlap > self.token_limit // 2:
             raise ValueError(
-                f"overlap ({self.overlap}) must be smaller than token_limit ({self.token_limit})"
+                f"overlap ({self.overlap}) must be at most half of token_limit ({self.token_limit})"
             )
 
         logger.debug(
@@ -110,7 +140,8 @@ class TextChunker:
         the running chunk has reached ``token_limit - tolerance`` (early-stop),
         and never let it grow past ``token_limit + tolerance`` (hard cap). Each
         subsequent chunk is seeded with trailing whole sentences from the
-        previous one, up to ``self.overlap`` tokens.
+        previous one, up to ``self.overlap`` tokens, as long as the seed and the
+        next sentence fit under the cap.
 
         Args:
             text: Text content to split.
@@ -124,77 +155,133 @@ class TextChunker:
         if total_tokens <= self.token_limit:
             return [(text, total_tokens)]
 
-        # Split on sentence boundaries — keep token counts alongside the text so
-        # we never recount the same sentence twice.
-        sentences = self.SENTENCE_PATTERN.split(text)
-        sentence_tokens = [self._count_tokens(s) for s in sentences]
-
         upper = self.token_limit + self.tolerance
         lower = self.token_limit - self.tolerance
 
         chunks: list[tuple[str, int]] = []
-        current_sentences: list[str] = []
-        current_counts: list[int] = []
+        current: list[_Unit] = []
         current_tokens = 0
         # Tracks the size of the overlap prefix carried over from the previous
         # chunk so the final flush can skip emitting an overlap-only tail.
         overlap_prefix_len = 0
 
-        for sentence, s_tokens in zip(sentences, sentence_tokens, strict=True):
+        for unit in self._split_units(text):
             # Only finalise once the running chunk contains at least one
             # sentence beyond the overlap carried over from the previous chunk
             # — otherwise we'd emit a duplicate of the previous chunk's tail.
-            has_new_content = len(current_sentences) > overlap_prefix_len
+            has_new_content = len(current) > overlap_prefix_len
             # Hard cap: adding this sentence would overshoot ``limit + tolerance``.
             # Early-stop: running chunk already inside the ± band; finalise at
             # the previous sentence boundary rather than overshoot the target.
-            if has_new_content and (current_tokens + s_tokens > upper or current_tokens >= lower):
-                chunks.append((" ".join(current_sentences), current_tokens))
-                (
-                    current_sentences,
-                    current_counts,
-                    current_tokens,
-                ) = self._build_overlap(current_sentences, current_counts)
-                overlap_prefix_len = len(current_sentences)
+            if has_new_content and (
+                current_tokens + unit.tokens > upper or current_tokens >= lower
+            ):
+                chunks.append((self._join(current), current_tokens))
+                current, current_tokens = self._build_overlap(current)
+                overlap_prefix_len = len(current)
 
-            current_sentences.append(sentence)
-            current_counts.append(s_tokens)
-            current_tokens += s_tokens
+            # The carried-over overlap never pushes a chunk past the cap: drop
+            # its oldest sentences until this one fits. Only the overlap can be
+            # dropped here — new content was finalised above if it did not fit.
+            while overlap_prefix_len and current_tokens + unit.tokens > upper:
+                current_tokens -= current.pop(0).tokens
+                overlap_prefix_len -= 1
+
+            current.append(unit)
+            current_tokens += unit.tokens
 
         # Flush remaining sentences. Skip overlap-only tails — they would
         # duplicate the previous chunk entirely without contributing new text.
-        if current_sentences and len(current_sentences) > overlap_prefix_len:
-            chunks.append((" ".join(current_sentences), current_tokens))
+        if current and len(current) > overlap_prefix_len:
+            chunks.append((self._join(current), current_tokens))
 
         return chunks
 
-    def _build_overlap(
-        self,
-        sentences: list[str],
-        counts: list[int],
-    ) -> tuple[list[str], list[int], int]:
+    def _split_units(self, text: str) -> list[_Unit]:
+        """
+        Split text into sentences, each no longer than ``token_limit + tolerance``.
+
+        A sentence over the cap is split on line breaks (table rows), and a
+        row still over the cap into windows of ``token_limit`` words. Each
+        unit keeps the whitespace before it, so joining units reproduces the
+        text exactly.
+        """
+        upper = self.token_limit + self.tolerance
+        units: list[_Unit] = []
+        for sep, sentence in self._split_keeping_separators(text, self._SENTENCE_SPLIT, ""):
+            tokens = self._count_tokens(sentence)
+            if tokens <= upper:
+                units.append(_Unit(sep, sentence, tokens))
+                continue
+            for row_sep, row in self._split_keeping_separators(sentence, self._LINE_SPLIT, sep):
+                row_tokens = self._count_tokens(row)
+                if row_tokens <= upper:
+                    units.append(_Unit(row_sep, row, row_tokens))
+                else:
+                    units.extend(self._word_windows(row_sep, row))
+        return units
+
+    @staticmethod
+    def _split_keeping_separators(
+        text: str,
+        pattern: re.Pattern[str],
+        lead: str,
+    ) -> list[tuple[str, str]]:
+        """
+        Split ``text`` on ``pattern`` (one capturing group) into
+        ``(separator, piece)`` pairs, ``lead`` being the separator before the
+        first piece. Concatenating the pairs reproduces ``lead + text``, minus
+        any trailing whitespace.
+        """
+        pairs: list[tuple[str, str]] = []
+        pending = lead
+        for i, part in enumerate(pattern.split(text)):
+            if i % 2 or not part:
+                pending += part
+                continue
+            pairs.append((pending, part))
+            pending = ""
+        return pairs
+
+    def _word_windows(self, sep: str, row: str) -> list[_Unit]:
+        """Split a row with no usable boundary into windows of ``token_limit`` words."""
+        spans = [m.span() for m in self._WORD.finditer(row)]
+        units: list[_Unit] = []
+        previous_end = 0
+        for i in range(0, len(spans), self.token_limit):
+            window = spans[i : i + self.token_limit]
+            start, end = window[0][0], window[-1][1]
+            lead = sep if i == 0 else ""
+            units.append(_Unit(lead + row[previous_end:start], row[start:end], len(window)))
+            previous_end = end
+        return units
+
+    @staticmethod
+    def _join(units: list[_Unit]) -> str:
+        """Rejoin units with their original separators."""
+        return units[0].text + "".join(u.sep + u.text for u in units[1:])
+
+    def _build_overlap(self, units: list[_Unit]) -> tuple[list[_Unit], int]:
         """
         Select trailing whole sentences from a just-finalised chunk to seed the
         next one. Walks backwards accumulating sentences while the total stays
         within ``self.overlap``. If even the single last sentence exceeds the
         budget, it is still reused whole — sentence boundaries are never split.
         """
-        if self.overlap == 0 or not sentences:
-            return [], [], 0
+        if self.overlap == 0 or not units:
+            return [], 0
 
-        overlap_sentences: list[str] = []
-        overlap_counts: list[int] = []
+        overlap_units: list[_Unit] = []
         overlap_tokens = 0
-        for sentence, s_tokens in zip(reversed(sentences), reversed(counts), strict=True):
-            if overlap_sentences and overlap_tokens + s_tokens > self.overlap:
+        for unit in reversed(units):
+            if overlap_units and overlap_tokens + unit.tokens > self.overlap:
                 break
-            overlap_sentences.insert(0, sentence)
-            overlap_counts.insert(0, s_tokens)
-            overlap_tokens += s_tokens
+            overlap_units.insert(0, unit)
+            overlap_tokens += unit.tokens
             if overlap_tokens >= self.overlap:
                 break
 
-        return overlap_sentences, overlap_counts, overlap_tokens
+        return overlap_units, overlap_tokens
 
     def chunk_segment(self, segment: Segment, start_index: int = 0) -> list[Chunk]:
         """
@@ -272,16 +359,20 @@ class TextChunker:
         min_tokens = min(token_counts)
         max_tokens = max(token_counts)
         avg_tokens = sum(token_counts) / len(token_counts)
-        over_limit = sum(1 for t in token_counts if t > self.token_limit)
+        # Chunks between the limit and the cap are normal (the ± band); only
+        # chunks past the cap would mean the fallback split failed.
+        cap = self.token_limit + self.tolerance
+        over_cap = sum(1 for t in token_counts if t > cap)
 
         logger.info(
-            "Created %d chunks from %d segments (tokens: %d-%d, avg %.0f, %d over limit)",
+            "Created %d chunks from %d segments (tokens: %d-%d, avg %.0f, %d over the %d-token cap)",
             len(chunks),
             len(segments),
             min_tokens,
             max_tokens,
             avg_tokens,
-            over_limit,
+            over_cap,
+            cap,
         )
 
         return chunks
