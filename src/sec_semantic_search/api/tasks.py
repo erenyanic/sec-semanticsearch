@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -33,6 +34,7 @@ from sec_semantic_search.config import get_settings
 from sec_semantic_search.core import (
     DatabaseError,
     FetchError,
+    FilingIdentifier,
     FilingLimitExceededError,
     SECSemanticSearchError,
     get_logger,
@@ -163,6 +165,93 @@ class TaskInfo:
     # WebSocket message queue — worker thread pushes typed dicts via
     # call_soon_threadsafe; WebSocket handler awaits them directly.
     _message_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+
+# ---------------------------------------------------------------------------
+# One-ahead fetch
+# ---------------------------------------------------------------------------
+
+
+class _FilingPrefetcher:
+    """
+    Fetch filing HTML one filing ahead of the ingest worker.
+
+    ``take()`` returns the HTML for the next filing in ``order`` and then
+    starts fetching the one after it, so the EDGAR round-trip for filing
+    *i+1* runs while filing *i* is parsed, embedded and stored. One worker
+    thread keeps fetches sequential and holds at most one filing's HTML
+    besides the one being processed.
+
+    ``take()`` must be called for every filing in ``order``, in order.
+    Whatever ``fetch`` raises, ``take()`` re-raises in the caller's thread.
+    """
+
+    def __init__(
+        self,
+        fetch: Callable[[FilingInfo], tuple[FilingIdentifier, str]],
+        order: list[FilingInfo],
+        *,
+        cancel_event: threading.Event,
+        thread_name: str,
+    ) -> None:
+        self._fetch = fetch
+        self._order = order
+        self._position = 0
+        self._cancel_event = cancel_event
+        self._in_flight: tuple[FilingInfo, Future] | None = None
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=thread_name)
+
+    def __enter__(self) -> _FilingPrefetcher:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def take(self, filing_info: FilingInfo) -> tuple[FilingIdentifier, str]:
+        """Wait for ``filing_info``'s HTML, then start fetching the next filing.
+
+        Raises:
+            _CancelledError: If the task was cancelled before the fetch began.
+            RuntimeError: If called out of order.
+        """
+        if self._in_flight is None:
+            self._submit_next()
+        if self._in_flight is None or self._in_flight[0] is not filing_info:
+            raise RuntimeError("Prefetch order does not match the ingest loop.")
+        _, future = self._in_flight
+        self._in_flight = None
+        try:
+            return future.result()
+        finally:
+            # Start the next fetch whether or not this one succeeded.
+            self._submit_next()
+
+    def close(self) -> None:
+        """Drop queued fetches without waiting for one already running.
+
+        A running fetch finishes in the background (edgartools bounds each
+        request with a timeout) and its result is discarded, so a cancel or
+        an early failure never waits on the network.
+        """
+        self._in_flight = None
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+    def _submit_next(self) -> None:
+        if self._position >= len(self._order):
+            return
+        filing_info = self._order[self._position]
+        self._position += 1
+        self._in_flight = (
+            filing_info,
+            self._pool.submit(self._fetch_unless_cancelled, filing_info),
+        )
+
+    def _fetch_unless_cancelled(self, filing_info: FilingInfo) -> tuple[FilingIdentifier, str]:
+        # Checked when the fetch starts, not when it was queued: a cancel
+        # during the previous filing skips this network call entirely.
+        if self._cancel_event.is_set():
+            raise _CancelledError
+        return self._fetch(filing_info)
 
 
 # ---------------------------------------------------------------------------
@@ -509,12 +598,12 @@ class TaskManager:
         Steps per filing:
             1. Fetch metadata (cheap — ``list_available``)
             2. Duplicate check
-            3. Fetch HTML content (on demand, one filing at a time)
+            3. Fetch HTML content (one filing ahead — see ``_FilingPrefetcher``)
             4. Process (parse → chunk → embed — expensive GPU)
             5. Store (ChromaDB first, then SQLite)
 
-        HTML is fetched per-filing just before processing, so only one
-        filing's HTML is in memory at a time.
+        The next filing's HTML downloads while the current one is
+        processed, so at most two filings' HTML are in memory at a time.
         """
         # Build the flat work list of filings to ingest (metadata only).
         work = self._run_with_edgar_identity(info, self._build_work_list, info)
@@ -541,212 +630,40 @@ class TaskManager:
         cached_count = self._registry.count()
         max_filings = settings.database.max_filings
 
-        for filing_info in work:
-            filing_id = filing_info.to_identifier()
+        # Fetch HTML one filing ahead: the next filing downloads while this
+        # one is parsed, embedded and stored. Duplicates are never fetched,
+        # and every fetch still goes through the EDGAR identity guard.
+        to_fetch = [fi for fi in work if fi.accession_number not in existing]
+        prefetcher = _FilingPrefetcher(
+            lambda fi: self._run_with_edgar_identity(info, self._fetcher.fetch_filing_content, fi),
+            to_fetch,
+            cancel_event=info.cancel_event,
+            thread_name=f"prefetch-{info.task_id[:8]}",
+        )
 
-            # --- Cancellation check (between filings) --------------------
-            if info.cancel_event.is_set():
-                self._rollback(info)
-                info.state = TaskState.CANCELLED
-                info.completed_at = datetime.now(UTC)
-                self._push(info, {"type": "cancelled"})
-                logger.info("Task %s cancelled", info.task_id[:8])
-                return
+        with prefetcher:
+            for filing_info in work:
+                filing_id = filing_info.to_identifier()
 
-            ticker = filing_id.ticker
-            form_type = filing_id.form_type
-
-            info.progress.current_ticker = ticker
-            info.progress.current_form_type = form_type
-            info.progress.step_label = "Checking duplicate"
-            info.progress.step_index = 1
-
-            # --- Duplicate check -----------------------------------------
-            if filing_id.accession_number in existing:
-                info.progress.filings_skipped += 1
-                info.progress.filings_done += 1
-                self._push(
-                    info,
-                    {
-                        "type": "filing_skipped",
-                        "ticker": ticker,
-                        "form_type": form_type,
-                        "accession_number": filing_id.accession_number,
-                        "reason": "duplicate",
-                    },
-                )
-                logger.info(
-                    "Task %s: skipped duplicate %s",
-                    info.task_id[:8],
-                    filing_id.accession_number,
-                )
-                continue
-
-            # --- Filing limit check (cached) ---------------------------------
-            if cached_count >= max_filings:
-                if settings.api.demo_mode:
-                    self._maybe_evict(info, 1)
-                    # Re-read count after eviction.
-                    cached_count = self._registry.count()
-                    if cached_count >= max_filings:
-                        exc = FilingLimitExceededError(cached_count, max_filings)
-                        info.state = TaskState.FAILED
-                        info.error = exc.message
-                        info.completed_at = datetime.now(UTC)
-                        self._push(
-                            info,
-                            {
-                                "type": "failed",
-                                "error": exc.message,
-                                "details": exc.details,
-                            },
-                        )
-                        return
-                else:
-                    exc = FilingLimitExceededError(cached_count, max_filings)
-                    info.state = TaskState.FAILED
-                    info.error = exc.message
+                # --- Cancellation check (between filings) --------------------
+                if info.cancel_event.is_set():
+                    self._rollback(info)
+                    info.state = TaskState.CANCELLED
                     info.completed_at = datetime.now(UTC)
-                    self._push(
-                        info,
-                        {
-                            "type": "failed",
-                            "error": exc.message,
-                            "details": exc.details,
-                        },
-                    )
+                    self._push(info, {"type": "cancelled"})
+                    logger.info("Task %s cancelled", info.task_id[:8])
                     return
 
-            # --- Fetch HTML content (on demand) --------------------------
-            info.progress.step_label = "Fetching"
-            info.progress.step_index = 0
+                ticker = filing_id.ticker
+                form_type = filing_id.form_type
 
-            try:
-                _, html_content = self._run_with_edgar_identity(
-                    info,
-                    self._fetcher.fetch_filing_content,
-                    filing_info,
-                )
-            except FetchError as exc:
-                info.progress.filings_failed += 1
-                info.progress.filings_done += 1
-                self._push(
-                    info,
-                    {
-                        "type": "filing_failed",
-                        "ticker": ticker,
-                        "form_type": form_type,
-                        "accession_number": filing_id.accession_number,
-                        "error": exc.message,
-                    },
-                )
-                logger.warning(
-                    "Task %s: fetch failed for %s — %s",
-                    info.task_id[:8],
-                    filing_id.accession_number,
-                    exc.message,
-                )
-                continue
+                info.progress.current_ticker = ticker
+                info.progress.current_form_type = form_type
+                info.progress.step_label = "Checking duplicate"
+                info.progress.step_index = 1
 
-            # --- Process (parse → chunk → embed) -------------------------
-            def _progress_cb(
-                step: str,
-                current: int,
-                total: int,
-                _self: TaskManager = self,
-                _info: TaskInfo = info,
-                _ticker: str = ticker,
-                _form: str = form_type,
-            ) -> None:
-                """Feed pipeline progress into task state."""
-                _info.progress.current_ticker = _ticker
-                _info.progress.current_form_type = _form
-                _info.progress.step_label = step
-                # Pipeline reports steps 1–4 (parse, chunk, embed, complete).
-                # We add fetching as step 0 and storing as step 4, giving
-                # 5 total: 0=fetch, 1=parse, 2=chunk, 3=embed, 4=store.
-                _info.progress.step_index = current  # 1-based from pipeline
-                _info.progress.step_total = 5
-
-                _self._push(
-                    _info,
-                    {
-                        "type": "step",
-                        "ticker": _ticker,
-                        "form_type": _form,
-                        "step": step,
-                        "step_number": current,
-                        "total_steps": 5,
-                    },
-                )
-
-                # Check cancellation between pipeline steps.
-                if _info.cancel_event.is_set():
-                    raise _CancelledError
-
-            info.progress.step_label = "Processing"
-            info.progress.step_index = 1
-
-            try:
-                result = self._orchestrator.process_filing(
-                    filing_id,
-                    html_content,
-                    progress_callback=_progress_cb,
-                )
-            except _CancelledError:
-                self._rollback(info)
-                info.state = TaskState.CANCELLED
-                info.completed_at = datetime.now(UTC)
-                self._push(info, {"type": "cancelled"})
-                logger.info("Task %s cancelled during processing", info.task_id[:8])
-                return
-            except SECSemanticSearchError as exc:
-                info.progress.filings_failed += 1
-                info.progress.filings_done += 1
-                self._push(
-                    info,
-                    {
-                        "type": "filing_failed",
-                        "ticker": ticker,
-                        "form_type": form_type,
-                        "accession_number": filing_id.accession_number,
-                        "error": exc.message,
-                    },
-                )
-                logger.warning(
-                    "Task %s: processing failed for %s — %s",
-                    info.task_id[:8],
-                    filing_id.accession_number,
-                    exc.message,
-                )
-                continue
-
-            # --- Store (ChromaDB first, then SQLite) ---------------------
-            info.progress.step_label = "Storing"
-            info.progress.step_index = 4
-
-            if info.cancel_event.is_set():
-                self._rollback(info)
-                info.state = TaskState.CANCELLED
-                info.completed_at = datetime.now(UTC)
-                self._push(info, {"type": "cancelled"})
-                return
-
-            try:
-                # Atomic check-then-insert: holds the SQLite lock across
-                # both the duplicate check and the INSERT, preventing the
-                # race window where two threads both pass is_duplicate()
-                # and then both attempt to register the same filing.
-                # SQLite registration is done first so that a late
-                # duplicate is caught before writing to ChromaDB.
-                registered = self._registry.register_filing_if_new(
-                    result.filing_id,
-                    result.ingest_result.chunk_count,
-                    segments=result.segments,
-                )
-                if not registered:
-                    # Another thread registered this filing between the
-                    # batch duplicate check and now — treat as a skip.
+                # --- Duplicate check -----------------------------------------
+                if filing_id.accession_number in existing:
                     info.progress.filings_skipped += 1
                     info.progress.filings_done += 1
                     self._push(
@@ -760,79 +677,267 @@ class TaskManager:
                         },
                     )
                     logger.info(
-                        "Task %s: skipped late duplicate %s",
+                        "Task %s: skipped duplicate %s",
                         info.task_id[:8],
                         filing_id.accession_number,
                     )
                     continue
 
+                # --- Filing limit check (cached) ---------------------------------
+                if cached_count >= max_filings:
+                    if settings.api.demo_mode:
+                        self._maybe_evict(info, 1)
+                        # Re-read count after eviction.
+                        cached_count = self._registry.count()
+                        if cached_count >= max_filings:
+                            exc = FilingLimitExceededError(cached_count, max_filings)
+                            info.state = TaskState.FAILED
+                            info.error = exc.message
+                            info.completed_at = datetime.now(UTC)
+                            self._push(
+                                info,
+                                {
+                                    "type": "failed",
+                                    "error": exc.message,
+                                    "details": exc.details,
+                                },
+                            )
+                            return
+                    else:
+                        exc = FilingLimitExceededError(cached_count, max_filings)
+                        info.state = TaskState.FAILED
+                        info.error = exc.message
+                        info.completed_at = datetime.now(UTC)
+                        self._push(
+                            info,
+                            {
+                                "type": "failed",
+                                "error": exc.message,
+                                "details": exc.details,
+                            },
+                        )
+                        return
+
+                # --- Fetch HTML content (prefetched) --------------------------
+                info.progress.step_label = "Fetching"
+                info.progress.step_index = 0
+
                 try:
-                    self._chroma.store_filing(result)
-                except DatabaseError:
-                    # ChromaDB store failed after SQLite succeeded —
-                    # roll back the SQLite entry to maintain consistency.
-                    self._registry.remove_filing(filing_id.accession_number)
-                    raise
-            except DatabaseError as exc:
-                info.progress.filings_failed += 1
+                    _, html_content = prefetcher.take(filing_info)
+                except _CancelledError:
+                    # Cancelled before this filing's fetch began.
+                    self._rollback(info)
+                    info.state = TaskState.CANCELLED
+                    info.completed_at = datetime.now(UTC)
+                    self._push(info, {"type": "cancelled"})
+                    logger.info("Task %s cancelled", info.task_id[:8])
+                    return
+                except FetchError as exc:
+                    info.progress.filings_failed += 1
+                    info.progress.filings_done += 1
+                    self._push(
+                        info,
+                        {
+                            "type": "filing_failed",
+                            "ticker": ticker,
+                            "form_type": form_type,
+                            "accession_number": filing_id.accession_number,
+                            "error": exc.message,
+                        },
+                    )
+                    logger.warning(
+                        "Task %s: fetch failed for %s — %s",
+                        info.task_id[:8],
+                        filing_id.accession_number,
+                        exc.message,
+                    )
+                    continue
+
+                # --- Process (parse → chunk → embed) -------------------------
+                def _progress_cb(
+                    step: str,
+                    current: int,
+                    total: int,
+                    _self: TaskManager = self,
+                    _info: TaskInfo = info,
+                    _ticker: str = ticker,
+                    _form: str = form_type,
+                ) -> None:
+                    """Feed pipeline progress into task state."""
+                    _info.progress.current_ticker = _ticker
+                    _info.progress.current_form_type = _form
+                    _info.progress.step_label = step
+                    # Pipeline reports steps 1–4 (parse, chunk, embed, complete).
+                    # We add fetching as step 0 and storing as step 4, giving
+                    # 5 total: 0=fetch, 1=parse, 2=chunk, 3=embed, 4=store.
+                    _info.progress.step_index = current  # 1-based from pipeline
+                    _info.progress.step_total = 5
+
+                    _self._push(
+                        _info,
+                        {
+                            "type": "step",
+                            "ticker": _ticker,
+                            "form_type": _form,
+                            "step": step,
+                            "step_number": current,
+                            "total_steps": 5,
+                        },
+                    )
+
+                    # Check cancellation between pipeline steps.
+                    if _info.cancel_event.is_set():
+                        raise _CancelledError
+
+                info.progress.step_label = "Processing"
+                info.progress.step_index = 1
+
+                try:
+                    result = self._orchestrator.process_filing(
+                        filing_id,
+                        html_content,
+                        progress_callback=_progress_cb,
+                    )
+                except _CancelledError:
+                    self._rollback(info)
+                    info.state = TaskState.CANCELLED
+                    info.completed_at = datetime.now(UTC)
+                    self._push(info, {"type": "cancelled"})
+                    logger.info("Task %s cancelled during processing", info.task_id[:8])
+                    return
+                except SECSemanticSearchError as exc:
+                    info.progress.filings_failed += 1
+                    info.progress.filings_done += 1
+                    self._push(
+                        info,
+                        {
+                            "type": "filing_failed",
+                            "ticker": ticker,
+                            "form_type": form_type,
+                            "accession_number": filing_id.accession_number,
+                            "error": exc.message,
+                        },
+                    )
+                    logger.warning(
+                        "Task %s: processing failed for %s — %s",
+                        info.task_id[:8],
+                        filing_id.accession_number,
+                        exc.message,
+                    )
+                    continue
+
+                # --- Store (ChromaDB first, then SQLite) ---------------------
+                info.progress.step_label = "Storing"
+                info.progress.step_index = 4
+
+                if info.cancel_event.is_set():
+                    self._rollback(info)
+                    info.state = TaskState.CANCELLED
+                    info.completed_at = datetime.now(UTC)
+                    self._push(info, {"type": "cancelled"})
+                    return
+
+                try:
+                    # Atomic check-then-insert: holds the SQLite lock across
+                    # both the duplicate check and the INSERT, preventing the
+                    # race window where two threads both pass is_duplicate()
+                    # and then both attempt to register the same filing.
+                    # SQLite registration is done first so that a late
+                    # duplicate is caught before writing to ChromaDB.
+                    registered = self._registry.register_filing_if_new(
+                        result.filing_id,
+                        result.ingest_result.chunk_count,
+                        segments=result.segments,
+                    )
+                    if not registered:
+                        # Another thread registered this filing between the
+                        # batch duplicate check and now — treat as a skip.
+                        info.progress.filings_skipped += 1
+                        info.progress.filings_done += 1
+                        self._push(
+                            info,
+                            {
+                                "type": "filing_skipped",
+                                "ticker": ticker,
+                                "form_type": form_type,
+                                "accession_number": filing_id.accession_number,
+                                "reason": "duplicate",
+                            },
+                        )
+                        logger.info(
+                            "Task %s: skipped late duplicate %s",
+                            info.task_id[:8],
+                            filing_id.accession_number,
+                        )
+                        continue
+
+                    try:
+                        self._chroma.store_filing(result)
+                    except DatabaseError:
+                        # ChromaDB store failed after SQLite succeeded —
+                        # roll back the SQLite entry to maintain consistency.
+                        self._registry.remove_filing(filing_id.accession_number)
+                        raise
+                except DatabaseError as exc:
+                    info.progress.filings_failed += 1
+                    info.progress.filings_done += 1
+                    self._push(
+                        info,
+                        {
+                            "type": "filing_failed",
+                            "ticker": ticker,
+                            "form_type": form_type,
+                            "accession_number": filing_id.accession_number,
+                            "error": exc.message,
+                        },
+                    )
+                    logger.warning(
+                        "Task %s: storage failed for %s — %s",
+                        info.task_id[:8],
+                        filing_id.accession_number,
+                        exc.message,
+                    )
+                    continue
+
+                # Record success and update the cached filing count.
+                cached_count += 1
+                info._stored_accessions.append(filing_id.accession_number)
+                info.results.append(
+                    FilingResult(
+                        ticker=filing_id.ticker,
+                        form_type=filing_id.form_type,
+                        filing_date=filing_id.date_str,
+                        accession_number=filing_id.accession_number,
+                        segment_count=result.ingest_result.segment_count,
+                        chunk_count=result.ingest_result.chunk_count,
+                        duration_seconds=result.ingest_result.duration_seconds,
+                    )
+                )
                 info.progress.filings_done += 1
+
                 self._push(
                     info,
                     {
-                        "type": "filing_failed",
-                        "ticker": ticker,
-                        "form_type": form_type,
+                        "type": "filing_done",
+                        "ticker": filing_id.ticker,
+                        "form_type": filing_id.form_type,
+                        "filing_date": filing_id.date_str,
                         "accession_number": filing_id.accession_number,
-                        "error": exc.message,
+                        "segments": result.ingest_result.segment_count,
+                        "chunks": result.ingest_result.chunk_count,
+                        "time": round(result.ingest_result.duration_seconds, 1),
                     },
                 )
-                logger.warning(
-                    "Task %s: storage failed for %s — %s",
+
+                logger.info(
+                    "Task %s: ingested %s %s (%s) — %d chunks in %.1fs",
                     info.task_id[:8],
-                    filing_id.accession_number,
-                    exc.message,
+                    filing_id.ticker,
+                    filing_id.form_type,
+                    filing_id.date_str,
+                    result.ingest_result.chunk_count,
+                    result.ingest_result.duration_seconds,
                 )
-                continue
-
-            # Record success and update the cached filing count.
-            cached_count += 1
-            info._stored_accessions.append(filing_id.accession_number)
-            info.results.append(
-                FilingResult(
-                    ticker=filing_id.ticker,
-                    form_type=filing_id.form_type,
-                    filing_date=filing_id.date_str,
-                    accession_number=filing_id.accession_number,
-                    segment_count=result.ingest_result.segment_count,
-                    chunk_count=result.ingest_result.chunk_count,
-                    duration_seconds=result.ingest_result.duration_seconds,
-                )
-            )
-            info.progress.filings_done += 1
-
-            self._push(
-                info,
-                {
-                    "type": "filing_done",
-                    "ticker": filing_id.ticker,
-                    "form_type": filing_id.form_type,
-                    "filing_date": filing_id.date_str,
-                    "accession_number": filing_id.accession_number,
-                    "segments": result.ingest_result.segment_count,
-                    "chunks": result.ingest_result.chunk_count,
-                    "time": round(result.ingest_result.duration_seconds, 1),
-                },
-            )
-
-            logger.info(
-                "Task %s: ingested %s %s (%s) — %d chunks in %.1fs",
-                info.task_id[:8],
-                filing_id.ticker,
-                filing_id.form_type,
-                filing_id.date_str,
-                result.ingest_result.chunk_count,
-                result.ingest_result.duration_seconds,
-            )
 
         # All filings processed — mark complete.
         if info.state == TaskState.RUNNING:
@@ -874,8 +979,8 @@ class TaskManager:
         Build a flat list of ``FilingInfo`` metadata objects.
 
         Only fetches lightweight metadata (no HTML content). HTML is
-        fetched per-filing in ``_execute()`` just before processing,
-        so only one filing's HTML is in memory at a time.
+        fetched in ``_execute()`` one filing ahead of processing, so at
+        most two filings' HTML are in memory at a time.
         """
         work: list[FilingInfo] = []
 
