@@ -154,10 +154,14 @@ class TestDeleteFiling:
 
     def test_existing(self):
         record = make_filing_record(chunk_count=50)
-        client, *_ = _make_client(get_filing_result=record)
+        client, registry, chroma = _make_client(get_filing_result=record)
         resp = client.delete("/api/filings/0000320193-24-000001")
         assert resp.status_code == 200
         assert resp.json()["chunks_deleted"] == 50  # from FilingRecord.chunk_count
+        # One delete path for single and bulk deletes.
+        chroma.delete_filings_batch.assert_called_once_with([record.accession_number])
+        registry.remove_filings_batch.assert_called_once_with([record.accession_number])
+        chroma.delete_filing.assert_not_called()
 
     def test_not_found(self):
         client, *_ = _make_client(get_filing_result=None)
@@ -167,7 +171,7 @@ class TestDeleteFiling:
     def test_database_error(self):
         record = make_filing_record()
         client, _, chroma = _make_client(get_filing_result=record)
-        chroma.delete_filing.side_effect = DatabaseError("disk full", details="ENOSPC")
+        chroma.delete_filings_batch.side_effect = DatabaseError("disk full", details="ENOSPC")
         resp = client.delete("/api/filings/0000320193-24-000001")
         assert resp.status_code == 500
         assert resp.json()["detail"]["error"] == "database_error"

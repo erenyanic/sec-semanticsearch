@@ -2,7 +2,7 @@
 Unit tests for TaskManager worker internals.
 
 Covers the previously untested static/internal methods:
-    - _effective_count() — 4 branches
+    - per_form_count() — the listing count per form
     - _rollback() — success and error tolerance
     - _push() — WebSocket message queuing
 """
@@ -13,59 +13,39 @@ import pytest
 
 from sec_semantic_search.api.tasks import TaskManager, TaskState
 from sec_semantic_search.core.exceptions import DatabaseError
+from sec_semantic_search.ingest import per_form_count
 from tests.helpers import make_task_info
 
 # -----------------------------------------------------------------------
-# _effective_count()
+# per_form_count() — shared by the CLI and the API
 # -----------------------------------------------------------------------
 
 
-class TestEffectiveCount:
-    """_effective_count() determines how many filings to fetch per form."""
+class TestPerFormCount:
+    """per_form_count() determines how many filings to list per form."""
 
     def test_per_form_with_count(self):
-        """per_form mode with explicit count should return that count."""
-        info = make_task_info(count_mode="per_form", count=3)
-        assert TaskManager._effective_count(info) == 3
+        assert per_form_count("per_form", 3, has_filters=False) == 3
 
     def test_per_form_without_count(self):
         """per_form mode without count falls through to default (1)."""
-        info = make_task_info(count_mode="per_form", count=None)
-        assert TaskManager._effective_count(info) == 1
+        assert per_form_count("per_form", None, has_filters=False) == 1
 
-    def test_latest_with_year_filter_no_count(self):
-        """With date filters active and no explicit count, return None (all matching)."""
-        info = make_task_info(count_mode="latest", count=None)
-        info.year = 2023
-        assert TaskManager._effective_count(info) is None
-
-    def test_latest_with_start_date_filter(self):
-        info = make_task_info(count_mode="latest", count=None)
-        info.start_date = "2023-01-01"
-        assert TaskManager._effective_count(info) is None
-
-    def test_latest_with_end_date_filter(self):
-        info = make_task_info(count_mode="latest", count=None)
-        info.end_date = "2023-12-31"
-        assert TaskManager._effective_count(info) is None
+    def test_latest_with_filters_no_count(self):
+        """With date filters active and no explicit count, list all matching."""
+        assert per_form_count("latest", None, has_filters=True) is None
 
     def test_latest_with_explicit_count(self):
         """Explicit count should be used even in 'latest' mode."""
-        info = make_task_info(count_mode="latest", count=5)
-        assert TaskManager._effective_count(info) == 5
+        assert per_form_count("latest", 5, has_filters=False) == 5
+        assert per_form_count("latest", 5, has_filters=True) == 5
 
     def test_default_returns_one(self):
         """No filters, no count, 'latest' mode → default to 1."""
-        info = make_task_info(count_mode="latest", count=None)
-        assert TaskManager._effective_count(info) == 1
+        assert per_form_count("latest", None, has_filters=False) == 1
 
-    def test_total_mode_with_count(self):
-        """'total' mode with count — _effective_count is only called for per-form,
-        but should still return the count if it falls through."""
-        info = make_task_info(count_mode="total", count=5)
-        # In total mode, _effective_count is called but count_mode != "per_form",
-        # so it falls through. With count=5 and no filters, returns 5.
-        assert TaskManager._effective_count(info) == 5
+
+# -----------------------------------------------------------------------
 
 
 # -----------------------------------------------------------------------

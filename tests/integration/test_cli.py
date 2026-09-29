@@ -153,6 +153,9 @@ class TestManageRemove:
         assert result.exit_code == 0
         assert "Removed" in result.output
         assert "100 chunks" in result.output  # from FilingRecord.chunk_count default
+        # The shared delete helper: ChromaDB first, then SQLite.
+        mock_chroma.delete_filings_batch.assert_called_once_with(["ACC-001"])
+        mock_registry.remove_filings_batch.assert_called_once_with(["ACC-001"])
 
     def test_confirmation_rejected(self):
         """Answering 'n' to the confirmation prompt should cancel removal."""
@@ -450,11 +453,15 @@ class TestIngestAcrossFormsFetch:
             patch("sec_semantic_search.cli.ingest.FilingFetcher") as fetcher_cls,
             patch("sec_semantic_search.cli.ingest.PipelineOrchestrator") as orchestrator_cls,
         ):
-            registry_cls.return_value.get_existing_accessions.return_value = set()
+            registry = registry_cls.return_value
+            registry.get_existing_accessions.return_value = set()
+            registry.count.return_value = 0
+            registry.register_filing_if_new.return_value = True
             fetcher = fetcher_cls.return_value
             fetcher.list_available_across_forms.return_value = infos
             fetcher.fetch_filing_content.side_effect = fetched
             processed = MagicMock()
+            processed.ingest_result.segment_count = 2
             processed.ingest_result.chunk_count = 3
             processed.ingest_result.duration_seconds = 0.1
             orchestrator_cls.return_value.process_filing.return_value = processed
@@ -465,6 +472,180 @@ class TestIngestAcrossFormsFetch:
         assert [c.args[0] for c in fetcher.fetch_filing_content.call_args_list] == infos
         fetcher.fetch_by_accession.assert_not_called()
         assert "2 ingested" in result.output
+
+
+# -----------------------------------------------------------------------
+# ingest add / batch on the shared runner
+# -----------------------------------------------------------------------
+
+
+def _filing_info(ticker, form, n):
+    from datetime import date
+
+    from sec_semantic_search.pipeline.fetch import FilingInfo
+
+    return FilingInfo(
+        ticker=ticker,
+        form_type=form,
+        filing_date=date(2024, 1, 1 + n),
+        accession_number=f"0000320193-24-{n:06d}",
+        company_name=ticker,
+        _filing_obj=MagicMock(),
+    )
+
+
+@pytest.fixture
+def cli_ingest():
+    """Patch the CLI's stores, fetcher and pipeline; storage succeeds."""
+    import threading
+
+    from sec_semantic_search.core.types import FilingIdentifier
+
+    fetch_threads: list[str] = []
+
+    def fetched(info):
+        fetch_threads.append(threading.current_thread().name)
+        return (
+            FilingIdentifier(info.ticker, info.form_type, info.filing_date, info.accession_number),
+            "<html></html>",
+        )
+
+    def processed(filing_id, html, progress_callback=None):
+        result = MagicMock()
+        result.filing_id = filing_id
+        result.ingest_result.segment_count = 2
+        result.ingest_result.chunk_count = 3
+        result.ingest_result.duration_seconds = 0.1
+        return result
+
+    with (
+        patch("sec_semantic_search.cli.ingest.MetadataRegistry") as registry_cls,
+        patch("sec_semantic_search.cli.ingest.ChromaDBClient") as chroma_cls,
+        patch("sec_semantic_search.cli.ingest.FilingFetcher") as fetcher_cls,
+        patch("sec_semantic_search.cli.ingest.PipelineOrchestrator") as orchestrator_cls,
+    ):
+        registry = registry_cls.return_value
+        registry.get_existing_accessions.return_value = set()
+        registry.count.return_value = 0
+        registry.register_filing_if_new.return_value = True
+        fetcher = fetcher_cls.return_value
+        fetcher.list_available.side_effect = lambda t, f, **kw: [_filing_info(t, f, 1)]
+        fetcher.fetch_filing_content.side_effect = fetched
+        orchestrator_cls.return_value.process_filing.side_effect = processed
+        yield MagicMock(
+            registry=registry,
+            chroma=chroma_cls.return_value,
+            fetcher=fetcher,
+            fetch_threads=fetch_threads,
+        )
+
+
+class TestIngestCommands:
+    """``ingest add`` and ``ingest batch`` run the shared runner."""
+
+    def test_add_default_lists_the_latest_per_form(self, cli_ingest):
+        result = runner.invoke(app, ["ingest", "add", "aapl"])
+
+        assert result.exit_code == 0, result.output
+        calls = cli_ingest.fetcher.list_available.call_args_list
+        assert [c.args for c in calls] == [("AAPL", "10-K"), ("AAPL", "10-Q")]
+        assert {c.kwargs["count"] for c in calls} == {1}
+        assert result.output.count("Ingested") == 2
+        assert "2 ingested" in result.output
+
+    def test_add_stores_sqlite_first(self, cli_ingest):
+        order: list[str] = []
+        cli_ingest.registry.register_filing_if_new.side_effect = lambda *a, **k: (
+            order.append("sqlite") or True
+        )
+        cli_ingest.chroma.store_filing.side_effect = lambda r: order.append("chroma")
+
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K"])
+
+        assert result.exit_code == 0, result.output
+        assert order == ["sqlite", "chroma"]
+        cli_ingest.registry.register_filing.assert_not_called()
+
+    def test_add_fetches_on_the_prefetch_thread(self, cli_ingest):
+        runner.invoke(app, ["ingest", "add", "AAPL"])
+        assert cli_ingest.fetch_threads
+        assert all(name.startswith("prefetch") for name in cli_ingest.fetch_threads)
+
+    @pytest.mark.parametrize(
+        ("args", "count", "year"),
+        [
+            (["-n", "2"], 2, None),
+            (["-y", "2023"], None, 2023),  # filters, no count: all matching
+        ],
+    )
+    def test_add_count_options(self, cli_ingest, args, count, year):
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K", *args])
+
+        assert result.exit_code == 0, result.output
+        kwargs = cli_ingest.fetcher.list_available.call_args.kwargs
+        assert (kwargs["count"], kwargs["year"]) == (count, year)
+
+    def test_add_skips_duplicates(self, cli_ingest):
+        cli_ingest.registry.get_existing_accessions.return_value = {
+            _filing_info("AAPL", "10-K", 1).accession_number
+        }
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K"])
+
+        assert result.exit_code == 0
+        assert "Already ingested" in result.output
+        cli_ingest.fetcher.fetch_filing_content.assert_not_called()
+
+    def test_add_exits_1_when_every_fetch_fails(self, cli_ingest):
+        from sec_semantic_search.core.exceptions import FetchError
+
+        cli_ingest.fetcher.fetch_filing_content.side_effect = FetchError("offline")
+        result = runner.invoke(app, ["ingest", "add", "AAPL"])
+
+        assert result.exit_code == 1
+        assert "Fetch failed" in result.output
+
+    def test_add_exits_1_when_every_listing_fails(self, cli_ingest):
+        from sec_semantic_search.core.exceptions import FetchError
+
+        cli_ingest.fetcher.list_available.side_effect = FetchError("unknown ticker")
+        result = runner.invoke(app, ["ingest", "add", "ZZZZ"])
+
+        assert result.exit_code == 1
+        assert "listing failed" in result.output
+
+    def test_add_stops_at_the_filing_limit(self, cli_ingest):
+        with patch("sec_semantic_search.cli.ingest.get_settings") as settings:
+            settings.return_value.database.max_filings = 0
+            result = runner.invoke(app, ["ingest", "add", "AAPL"])
+
+        assert result.exit_code == 1
+        assert "Filing limit reached" in result.output
+        cli_ingest.chroma.store_filing.assert_not_called()
+
+    def test_add_total_and_number_are_exclusive(self, cli_ingest):
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-t", "2", "-n", "2"])
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_batch_total_lists_across_forms_per_ticker(self, cli_ingest):
+        cli_ingest.fetcher.list_available_across_forms.side_effect = lambda t, forms, **kw: [
+            _filing_info(t, "10-Q", 1 if t == "AAPL" else 2)
+        ]
+        result = runner.invoke(app, ["ingest", "batch", "AAPL", "MSFT", "-t", "3"])
+
+        assert result.exit_code == 0, result.output
+        calls = cli_ingest.fetcher.list_available_across_forms.call_args_list
+        assert [c.args[0] for c in calls] == ["AAPL", "MSFT"]
+        assert {c.kwargs["count"] for c in calls} == {3}
+        assert "Batch complete" in result.output
+        assert "2 ingested" in result.output
+
+    def test_no_filings_found(self, cli_ingest):
+        cli_ingest.fetcher.list_available.side_effect = lambda *a, **k: []
+        result = runner.invoke(app, ["ingest", "add", "AAPL"])
+
+        assert result.exit_code == 0
+        assert "No filings found" in result.output
 
 
 # -----------------------------------------------------------------------

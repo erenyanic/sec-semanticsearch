@@ -194,7 +194,7 @@ class TestErrorRedaction:
         registry.get_filing.return_value = record
 
         chroma = MagicMock()
-        chroma.delete_filing.side_effect = DatabaseError(
+        chroma.delete_filings_batch.side_effect = DatabaseError(
             "SQLite error", details="UNIQUE constraint failed on filings.accession_number"
         )
 
@@ -460,17 +460,34 @@ class TestTaskQueueCap:
 class TestAtomicRegistration:
     """SQLite registration must be atomic to prevent race conditions."""
 
-    def test_task_manager_uses_atomic_registration(self):
-        """TaskManager._execute() store step uses register_filing_if_new."""
-        import inspect
+    def test_ingest_stores_through_atomic_registration(self):
+        """The shared ingest loop (CLI and API) registers with
+        register_filing_if_new, never the check-then-insert pair."""
+        from sec_semantic_search.ingest import store_processed_filing
 
-        from sec_semantic_search.api.tasks import TaskManager
+        registry = MagicMock()
+        registry.register_filing_if_new.return_value = True
+        chroma = MagicMock()
+        result = MagicMock()
 
-        source = inspect.getsource(TaskManager._execute)
-        # The atomic method must be used, not the non-atomic register_filing.
-        assert "register_filing_if_new" in source
-        # The old non-atomic pattern should not be present.
-        assert "register_filing(" not in source.replace("register_filing_if_new", "")
+        assert store_processed_filing(result, registry=registry, chroma=chroma) is True
+        registry.register_filing_if_new.assert_called_once_with(
+            result.filing_id,
+            result.ingest_result.chunk_count,
+            segments=result.segments,
+        )
+        registry.register_filing.assert_not_called()
+        chroma.store_filing.assert_called_once_with(result)
+
+    def test_late_duplicate_writes_nothing(self):
+        from sec_semantic_search.ingest import store_processed_filing
+
+        registry = MagicMock()
+        registry.register_filing_if_new.return_value = False
+        chroma = MagicMock()
+
+        assert store_processed_filing(MagicMock(), registry=registry, chroma=chroma) is False
+        chroma.store_filing.assert_not_called()
 
     def test_register_filing_if_new_holds_lock(self):
         """register_filing_if_new must hold the lock across check and insert."""
@@ -485,28 +502,30 @@ class TestAtomicRegistration:
 
     def test_chromadb_rollback_on_failure(self):
         """If ChromaDB store fails after SQLite registration, SQLite is rolled back."""
+        from sec_semantic_search.ingest import store_processed_filing
+
         registry = MagicMock()
         registry.register_filing_if_new.return_value = True
         chroma = MagicMock()
         chroma.store_filing.side_effect = DatabaseError("ChromaDB write error", details="disk full")
-        fetcher = MagicMock()
-        orchestrator = MagicMock()
+        result = MagicMock()
+        result.filing_id.accession_number = "0000320193-24-000001"
 
-        manager = TaskManager(
-            registry=registry,
-            chroma=chroma,
-            fetcher=fetcher,
-            orchestrator=orchestrator,
-        )
-        manager.shutdown()
+        with pytest.raises(DatabaseError, match="ChromaDB write error"):
+            store_processed_filing(result, registry=registry, chroma=chroma)
+        registry.remove_filing.assert_called_once_with("0000320193-24-000001")
 
-        # Verify that remove_filing is called to roll back SQLite
-        # when ChromaDB fails. We check the source code structure
-        # because the full _execute flow requires extensive mocking.
-        import inspect
+    def test_failed_rollback_keeps_the_original_error(self):
+        from sec_semantic_search.ingest import store_processed_filing
 
-        source = inspect.getsource(TaskManager._execute)
-        assert "remove_filing" in source
+        registry = MagicMock()
+        registry.register_filing_if_new.return_value = True
+        registry.remove_filing.side_effect = DatabaseError("SQLite locked")
+        chroma = MagicMock()
+        chroma.store_filing.side_effect = DatabaseError("ChromaDB write error")
+
+        with pytest.raises(DatabaseError, match="ChromaDB write error"):
+            store_processed_filing(MagicMock(), registry=registry, chroma=chroma)
 
 
 # -----------------------------------------------------------------------

@@ -159,8 +159,8 @@ def delete_filing(
         )
 
     try:
-        chroma.delete_filing(accession)
-        registry.remove_filing(accession)
+        # The same helper as the bulk deletes: ChromaDB first, then SQLite.
+        delete_filings_batch([record], chroma=chroma, registry=registry)
     except DatabaseError as exc:
         logger.error("Delete filing %s failed: %s", accession, exc.details)
         raise HTTPException(

@@ -199,8 +199,7 @@ def remove(
 
         try:
             chroma = ChromaDBClient()
-            chroma.delete_filing(accession_number)
-            registry.remove_filing(accession_number)
+            delete_filings_batch([filing], chroma=chroma, registry=registry)
         except DatabaseError as e:
             console.print(f"[red]Removal failed:[/red] {e.message}")
             console.print(

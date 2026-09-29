@@ -1,5 +1,6 @@
 """
-Tests for the one-ahead HTML fetch in ``TaskManager._execute()`` (F-04).
+Tests for the one-ahead HTML fetch in the shared ingest loop, driven
+through ``TaskManager._execute()``.
 
 Covers:
     - The next filing is fetched while the current one is processed
@@ -16,13 +17,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from sec_semantic_search.api.tasks import (
-    TaskManager,
-    TaskState,
-    _CancelledError,
-    _FilingPrefetcher,
-)
+from sec_semantic_search.api.tasks import TaskManager, TaskState
 from sec_semantic_search.core.exceptions import FetchError
+from sec_semantic_search.ingest import FilingPrefetcher, IngestCancelled
 from tests.helpers import make_task_info
 
 # Generous bound for event waits; only reached when a test is failing.
@@ -164,8 +161,12 @@ class TestOverlap:
         fetched = [c.args[0] for c in manager._fetcher.fetch_filing_content.call_args_list]
         assert fetched == [work[0], work[2]]
         assert info.progress.filings_skipped == 1
-        types = [m["type"] for m in _messages(info)]
+        messages = _messages(info)
+        types = [m["type"] for m in messages if m["type"] != "step"]
         assert types == ["filing_done", "filing_skipped", "filing_done", "completed"]
+        # Duplicates get no steps: Fetching and Storing for filings 0 and 2 only.
+        steps = [(m["step"], m["step_number"]) for m in messages if m["type"] == "step"]
+        assert steps == [("Fetching", 0), ("Storing", 4)] * 2
 
 
 # -----------------------------------------------------------------------
@@ -272,7 +273,7 @@ class TestCancellation:
         manager._rollback = MagicMock()
         info = make_task_info(state=TaskState.RUNNING)
 
-        with patch.object(_FilingPrefetcher, "take", side_effect=_CancelledError):
+        with patch.object(FilingPrefetcher, "take", side_effect=IngestCancelled):
             manager._execute(info)
 
         assert info.state == TaskState.CANCELLED
@@ -282,7 +283,7 @@ class TestCancellation:
 
 
 # -----------------------------------------------------------------------
-# _FilingPrefetcher on its own
+# FilingPrefetcher on its own
 # -----------------------------------------------------------------------
 
 
@@ -291,7 +292,7 @@ class TestPrefetcher:
 
     def test_take_out_of_order_raises(self):
         a, b = _filing(0), _filing(1)
-        with _FilingPrefetcher(
+        with FilingPrefetcher(
             lambda fi: (None, ""), [a, b], cancel_event=threading.Event(), thread_name="t"
         ) as prefetcher:
             with pytest.raises(RuntimeError, match="order"):
@@ -301,8 +302,8 @@ class TestPrefetcher:
         fetch = MagicMock()
         cancel = threading.Event()
         cancel.set()
-        with _FilingPrefetcher(fetch, [_filing(0)], cancel_event=cancel, thread_name="t") as p:
-            with pytest.raises(_CancelledError):
+        with FilingPrefetcher(fetch, [_filing(0)], cancel_event=cancel, thread_name="t") as p:
+            with pytest.raises(IngestCancelled):
                 p.take(p._order[0])
         fetch.assert_not_called()
 
@@ -317,9 +318,7 @@ class TestPrefetcher:
                 release.wait(_WAIT)
             return None, "<html></html>"
 
-        prefetcher = _FilingPrefetcher(
-            fetch, order, cancel_event=threading.Event(), thread_name="t"
-        )
+        prefetcher = FilingPrefetcher(fetch, order, cancel_event=threading.Event(), thread_name="t")
         try:
             prefetcher.take(order[0])
             assert running.wait(_WAIT)

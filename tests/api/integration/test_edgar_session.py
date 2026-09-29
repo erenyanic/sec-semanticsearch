@@ -460,11 +460,65 @@ class TestTaskManagerEdgarIdentityIsolation:
         fetcher.apply_identity.assert_called_once_with(None, None)
         manager.shutdown()
 
-    def test_execute_routes_edgar_calls_through_identity_guard(self):
-        import inspect
+    def test_execute_runs_every_edgar_call_under_the_task_identity(self):
+        """Listing and every HTML fetch hold the EDGAR lock with this task's
+        identity applied (the identity is process-global in edgartools)."""
+        from datetime import date
 
-        source = inspect.getsource(TaskManager._execute)
+        from sec_semantic_search.api.tasks import TaskState
+        from sec_semantic_search.core.types import FilingIdentifier
+        from sec_semantic_search.pipeline.fetch import FilingInfo
 
-        assert "_run_with_edgar_identity(info, self._build_work_list, info)" in source
-        assert "self._fetcher.fetch_filing_content" in source
-        assert "_run_with_edgar_identity(" in source
+        registry = MagicMock()
+        registry.get_existing_accessions.return_value = set()
+        registry.count.return_value = 0
+        registry.register_filing_if_new.return_value = True
+        fetcher = MagicMock()
+        orchestrator = MagicMock()
+        manager = TaskManager(
+            registry=registry, chroma=MagicMock(), fetcher=fetcher, orchestrator=orchestrator
+        )
+        info = make_task_info(tickers=["AAPL"], form_types=["10-K"], state=TaskState.RUNNING)
+        info.edgar_name = "Session User"
+        info.edgar_email = "session@example.com"
+
+        applied: list[tuple] = []
+        seen: list[tuple] = []
+        fetcher.apply_identity.side_effect = lambda name, email: applied.append((name, email))
+        filings = [
+            FilingInfo("AAPL", "10-K", date(2024, 11, 1), f"0000320193-24-00000{i}", "Apple")
+            for i in (1, 2)
+        ]
+
+        def listing(*args, **kwargs):
+            seen.append(("list", manager._edgar_lock.locked(), applied[-1]))
+            return filings
+
+        def fetch(fi):
+            seen.append(("fetch", manager._edgar_lock.locked(), applied[-1]))
+            return (
+                FilingIdentifier("AAPL", "10-K", fi.filing_date, fi.accession_number),
+                "<html></html>",
+            )
+
+        fetcher.list_available.side_effect = listing
+        fetcher.fetch_filing_content.side_effect = fetch
+        processed = MagicMock()
+        processed.ingest_result.segment_count = 1
+        processed.ingest_result.chunk_count = 1
+        processed.ingest_result.duration_seconds = 0.1
+        orchestrator.process_filing.return_value = processed
+
+        with patch("sec_semantic_search.api.tasks.get_settings") as settings:
+            settings.return_value.api.demo_mode = False
+            settings.return_value.database.max_filings = 100
+            manager._execute(info)
+        manager.shutdown()
+
+        identity = ("Session User", "session@example.com")
+        assert seen == [
+            ("list", True, identity),
+            ("fetch", True, identity),
+            ("fetch", True, identity),
+        ]
+        assert info.state == TaskState.COMPLETED

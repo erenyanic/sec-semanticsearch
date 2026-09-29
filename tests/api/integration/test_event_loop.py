@@ -122,9 +122,9 @@ class TestHandlersRunInThreadpool:
         calls: list[bool] = []
         registry = MagicMock()
         registry.get_filing.return_value = _record()
-        registry.remove_filing.side_effect = _recording(calls)
+        registry.remove_filings_batch.side_effect = _recording(calls)
         chroma = MagicMock()
-        chroma.delete_filing.side_effect = _recording(calls)
+        chroma.delete_filings_batch.side_effect = _recording(calls)
         app.dependency_overrides[get_registry] = lambda: registry
         app.dependency_overrides[get_chroma] = lambda: chroma
 
