@@ -6,6 +6,7 @@ Tests verify that the fix is in place and working correctly.
 """
 
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1845,6 +1846,47 @@ class TestProxyHeadersConfiguration:
         content = nginx_conf.read_text()
         assert "X-Forwarded-For" in content
         assert "X-Real-IP" in content
+
+
+class TestNginxAdminRouting:
+    """``/api/admin/*`` are Next.js route handlers that hold the admin key
+    server-side (AD#32). Behind nginx they must reach the frontend, not
+    FastAPI, which has no admin routes: routed to the API, admin login
+    returned 404 under Docker Compose."""
+
+    @staticmethod
+    def _locations(block: str) -> dict[str, str]:
+        """Map each ``location`` prefix in a server block to its upstream."""
+        out: dict[str, str] = {}
+        for match in re.finditer(r"location (\S+) \{(.*?)\}", block, re.S):
+            upstream = re.search(r"proxy_pass http://(\w+);", match.group(2))
+            out[match.group(1)] = upstream.group(1) if upstream else ""
+        return out
+
+    def _blocks(self) -> tuple[str, str]:
+        content = (Path(__file__).parents[3] / "nginx.conf").read_text()
+        http_block = content[content.index("# ── HTTP server") : content.index("# ── TLS server")]
+        tls_block = content[content.index("# ── TLS server") :]
+        # The TLS template is commented out; strip the comment markers.
+        tls_block = "\n".join(line.lstrip("#") for line in tls_block.splitlines())
+        return http_block, tls_block
+
+    def test_admin_prefix_routes_to_frontend(self):
+        for block in self._blocks():
+            locations = self._locations(block)
+            assert locations["/api/admin/"] == "frontend_app"
+            assert locations["/api/"] == "api_backend"
+
+    def test_admin_location_forwards_client_ip(self):
+        """The Next.js admin limiter keys on the client address."""
+        http_block, _ = self._blocks()
+        admin = re.search(r"location /api/admin/ \{(.*?)\}", http_block, re.S).group(1)
+        assert "X-Forwarded-For $proxy_add_x_forwarded_for" in admin
+        assert "X-Real-IP $remote_addr" in admin
+
+    def test_fastapi_serves_no_admin_routes(self):
+        paths = {getattr(route, "path", "") for route in app.routes}
+        assert not any(path.startswith("/api/admin") for path in paths)
 
 
 # -----------------------------------------------------------------------
