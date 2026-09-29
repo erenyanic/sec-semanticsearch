@@ -122,6 +122,14 @@ The SEC requires a name and email in the User-Agent header of every EDGAR reques
 
 See [`.env.example`](.env.example) for the full variable list with descriptions.
 
+**Sizing `DB_MAX_FILINGS`:** each filing (about 270 chunks) takes about
+3.2 MB on disk — 2.9 MB in ChromaDB (0.9 MB HNSW index, the rest chunk
+text, metadata and ChromaDB's built-in full-text index) and 0.3 MB in the
+SQLite registry — and the loaded index about 1 MB of RAM. The default
+2,500 filings therefore need about 8 GB of disk and 2.5 GB of RAM on top of
+the embedding model. To measure your own store (with the API stopped):
+`python scripts/measure_store.py`.
+
 ---
 
 ## CLI
