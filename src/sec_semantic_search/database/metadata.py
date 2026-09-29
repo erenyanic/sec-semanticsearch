@@ -226,12 +226,14 @@ class MetadataRegistry:
         """
         Initialise the metadata registry.
 
-        Opens a single persistent SQLite connection that is reused across
-        all method calls, protected by a threading lock.  WAL journal mode
-        is enabled for better concurrent read/write performance.
+        Opens two persistent SQLite connections, each behind its own
+        threading lock: one for writes and one, ``query_only``, for reads.
+        In WAL mode readers do not block on the writer, but only across
+        connections — so a search's parent lookup no longer waits for an
+        ingest's segment inserts.
 
         When *encryption_key* is provided (or ``DB_ENCRYPTION_KEY`` is set),
-        the connection uses ``pysqlcipher3`` and issues ``PRAGMA key``
+        both connections use ``pysqlcipher3`` and issue ``PRAGMA key``
         immediately after opening.
 
         Args:
@@ -255,27 +257,17 @@ class MetadataRegistry:
         # Select the appropriate SQLite driver (sqlcipher or sqlite3).
         self._sqlite_module = _get_sqlite_module(self._encryption_key)
 
-        # Persistent connection — shared across all method calls.
+        # Write connection — every INSERT/UPDATE/DELETE and the schema.
         # check_same_thread=False allows the API's background worker
         # threads to use the same connection; the lock serialises access.
-        self._conn = self._sqlite_module.connect(
-            self._db_path,
-            check_same_thread=False,
-        )
-
-        # When using SQLCipher, PRAGMA key MUST be the very first
-        # statement executed on the connection — before any other
-        # PRAGMA or query.  PRAGMA does not support parameter binding,
-        # so we hex-encode the key as a blob literal to avoid any
-        # SQL injection risk (defence in depth, even though the key
-        # comes from env vars).
-        if self._encryption_key and self._sqlite_module is not sqlite3:
-            hex_key = self._encryption_key.encode().hex()
-            self._conn.execute(f"PRAGMA key = \"x'{hex_key}'\"")
-            logger.debug("SQLCipher PRAGMA key applied")
-
-        self._conn.row_factory = self._sqlite_module.Row
+        self._conn = self._connect()
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # In WAL mode NORMAL keeps the database consistent across an
+        # application crash and drops the fsync on every commit; a power
+        # loss can lose the last transactions. Acceptable for a registry
+        # whose filings are re-ingestible (see DEPLOYMENT.md).
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
         self._lock = threading.Lock()
 
         self._encrypted = self._encryption_key is not None and self._sqlite_module is not sqlite3
@@ -289,14 +281,56 @@ class MetadataRegistry:
         # Create table on init (idempotent)
         self._create_table()
 
+        # Read connection — opened after the schema exists and WAL is on.
+        # Autocommit (isolation_level=None): each SELECT sees the latest
+        # committed data, and a multi-statement read opens its own
+        # transaction (``list_filings_page``). ``query_only`` makes any
+        # write through it fail, so reads can never bypass the write lock.
+        self._read_conn = self._connect(isolation_level=None)
+        self._read_conn.execute("PRAGMA query_only=ON")
+        self._read_conn.execute("PRAGMA temp_store=MEMORY")
+        self._read_lock = threading.Lock()
+        try:
+            # Pays the SQLCipher key derivation now and fails fast on a
+            # wrong key, rather than on the first search.
+            self._read_conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        except self._db_error as e:
+            self.close()
+            raise DatabaseError(
+                "Failed to open metadata read connection",
+                details=str(e),
+            ) from e
+
         logger.debug(
             "MetadataRegistry initialised: %s (encrypted=%s)",
             self._db_path,
             self._encrypted,
         )
 
+    def _connect(self, **kwargs: Any) -> Any:
+        """Open a connection to the registry database.
+
+        When using SQLCipher, ``PRAGMA key`` MUST be the very first
+        statement executed on the connection — before any other PRAGMA
+        or query. PRAGMA does not support parameter binding, so the key
+        is hex-encoded as a blob literal to avoid any SQL injection risk
+        (defence in depth, even though the key comes from env vars).
+        """
+        conn = self._sqlite_module.connect(
+            self._db_path,
+            check_same_thread=False,
+            **kwargs,
+        )
+        if self._encryption_key and self._sqlite_module is not sqlite3:
+            hex_key = self._encryption_key.encode().hex()
+            conn.execute(f"PRAGMA key = \"x'{hex_key}'\"")
+            logger.debug("SQLCipher PRAGMA key applied")
+        conn.row_factory = self._sqlite_module.Row
+        return conn
+
     def close(self) -> None:
-        """Close the persistent database connection."""
+        """Close both database connections."""
+        self._read_conn.close()
         self._conn.close()
         logger.debug("MetadataRegistry connection closed: %s", self._db_path)
 
@@ -402,8 +436,8 @@ class MetadataRegistry:
         """
         sql = "SELECT 1 FROM filings WHERE accession_number = ? LIMIT 1"
         try:
-            with self._lock:
-                row = self._conn.execute(sql, (accession_number,)).fetchone()
+            with self._read_lock:
+                row = self._read_conn.execute(sql, (accession_number,)).fetchone()
             return row is not None
         except self._db_error as e:
             raise DatabaseError(
@@ -437,8 +471,8 @@ class MetadataRegistry:
         placeholders = ", ".join("?" for _ in accession_numbers)
         sql = f"SELECT accession_number FROM filings WHERE accession_number IN ({placeholders})"
         try:
-            with self._lock:
-                rows = self._conn.execute(sql, accession_numbers).fetchall()
+            with self._read_lock:
+                rows = self._read_conn.execute(sql, accession_numbers).fetchall()
             return {row["accession_number"] for row in rows}
         except self._db_error as e:
             raise DatabaseError(
@@ -733,8 +767,8 @@ class MetadataRegistry:
         """
         sql = "SELECT * FROM filings WHERE accession_number = ?"
         try:
-            with self._lock:
-                row = self._conn.execute(sql, (accession_number,)).fetchone()
+            with self._read_lock:
+                row = self._read_conn.execute(sql, (accession_number,)).fetchone()
             if row is None:
                 return None
             return self._row_to_record(row)
@@ -776,8 +810,8 @@ class MetadataRegistry:
             placeholders = ", ".join("?" for _ in batch)
             sql = f"SELECT * FROM filings WHERE accession_number IN ({placeholders})"
             try:
-                with self._lock:
-                    rows = self._conn.execute(sql, batch).fetchall()
+                with self._read_lock:
+                    rows = self._read_conn.execute(sql, batch).fetchall()
                 records.extend(self._row_to_record(row) for row in rows)
             except self._db_error as e:
                 raise DatabaseError(
@@ -817,8 +851,8 @@ class MetadataRegistry:
         sql += " ORDER BY filing_date DESC"
 
         try:
-            with self._lock:
-                rows = self._conn.execute(sql, params).fetchall()
+            with self._read_lock:
+                rows = self._read_conn.execute(sql, params).fetchall()
             return [self._row_to_record(row) for row in rows]
         except self._db_error as e:
             raise DatabaseError(
@@ -847,8 +881,8 @@ class MetadataRegistry:
         Return one sorted page of filings and the total matching the filters.
 
         Sorting and slicing happen in SQLite; ``id`` breaks ties so pages
-        never overlap or skip rows. The count and the page are read under
-        one lock, so ``total`` always describes the same snapshot.
+        never overlap or skip rows. The count and the page are read in
+        one read transaction, so ``total`` always describes the same snapshot.
 
         Args:
             ticker: Filter by ticker symbol (case-insensitive).
@@ -888,11 +922,17 @@ class MetadataRegistry:
         )
 
         try:
-            with self._lock:
-                total = self._conn.execute(
-                    f"SELECT COUNT(*) FROM filings{where}", params
-                ).fetchone()[0]
-                rows = self._conn.execute(page_sql, [*params, limit, offset]).fetchall()
+            with self._read_lock:
+                # One read transaction: a commit on the write connection
+                # between the two statements cannot make them disagree.
+                self._read_conn.execute("BEGIN")
+                try:
+                    total = self._read_conn.execute(
+                        f"SELECT COUNT(*) FROM filings{where}", params
+                    ).fetchone()[0]
+                    rows = self._read_conn.execute(page_sql, [*params, limit, offset]).fetchall()
+                finally:
+                    self._read_conn.execute("COMMIT")
             return [self._row_to_record(row) for row in rows], total
         except self._db_error as e:
             raise DatabaseError(
@@ -918,8 +958,8 @@ class MetadataRegistry:
         """
         sql = "SELECT * FROM filings ORDER BY ingested_at ASC LIMIT ?"
         try:
-            with self._lock:
-                rows = self._conn.execute(sql, (limit,)).fetchall()
+            with self._read_lock:
+                rows = self._read_conn.execute(sql, (limit,)).fetchall()
             return [self._row_to_record(row) for row in rows]
         except self._db_error as e:
             raise DatabaseError(
@@ -956,8 +996,8 @@ class MetadataRegistry:
             params.append(form_type.upper())
 
         try:
-            with self._lock:
-                row = self._conn.execute(sql, params).fetchone()
+            with self._read_lock:
+                row = self._read_conn.execute(sql, params).fetchone()
             return row[0]
         except self._db_error as e:
             raise DatabaseError(
@@ -992,8 +1032,8 @@ class MetadataRegistry:
             ORDER BY ticker, form_type
         """
         try:
-            with self._lock:
-                rows = self._conn.execute(sql).fetchall()
+            with self._read_lock:
+                rows = self._read_conn.execute(sql).fetchall()
         except self._db_error as e:
             raise DatabaseError(
                 "Failed to retrieve database statistics",
@@ -1124,8 +1164,8 @@ class MetadataRegistry:
         """
         sql = "SELECT * FROM task_history WHERE task_id = ?"
         try:
-            with self._lock:
-                row = self._conn.execute(sql, (task_id,)).fetchone()
+            with self._read_lock:
+                row = self._read_conn.execute(sql, (task_id,)).fetchone()
             if row is None:
                 return None
             return {
@@ -1265,8 +1305,8 @@ class MetadataRegistry:
                 params.append(accession)
                 params.append(seg_idx)
             try:
-                with self._lock:
-                    rows = self._conn.execute(sql, params).fetchall()
+                with self._read_lock:
+                    rows = self._read_conn.execute(sql, params).fetchall()
             except self._db_error as e:
                 raise DatabaseError(
                     "Failed to fetch parent segments",
@@ -1290,8 +1330,8 @@ class MetadataRegistry:
             sql = "SELECT COUNT(*) FROM segments WHERE accession_number = ?"
             params = (accession_number,)
         try:
-            with self._lock:
-                row = self._conn.execute(sql, params).fetchone()
+            with self._read_lock:
+                row = self._read_conn.execute(sql, params).fetchone()
             return row[0]
         except self._db_error as e:
             raise DatabaseError(
