@@ -11,10 +11,13 @@
  * this component (and its children that use hooks) in the browser.
  *
  * How it works:
- *   1. On first load, reads the saved theme from `localStorage`.
- *      Falls back to the OS preference via `prefers-color-scheme`.
- *   2. Applies a `dark` class on `<html>` — Tailwind's `dark:`
- *      variant uses this to swap colours.
+ *   1. Before first paint, the root layout's inline script
+ *      (`themeInitScript` in `lib/theme.ts`) sets the `dark` class on
+ *      `<html>` from `localStorage`, falling back to the OS preference
+ *      via `prefers-color-scheme`.  Tailwind's `dark:` variant uses
+ *      this class to swap colours.
+ *   2. After hydration, this provider reads the same value and keeps
+ *      the class in step when the theme changes.
  *   3. Exposes `theme` and `toggleTheme` via React Context so any
  *      component can read or change the theme.
  */
@@ -26,12 +29,11 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { THEME_STORAGE_KEY as STORAGE_KEY, type Theme } from "@/lib/theme";
 
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
-
-type Theme = "light" | "dark";
 
 interface ThemeContextValue {
   theme: Theme;
@@ -50,8 +52,6 @@ const ThemeContext = createContext<ThemeContextValue>(null!);
 // ---------------------------------------------------------------------------
 // Provider component
 // ---------------------------------------------------------------------------
-
-const STORAGE_KEY = "sec-search-theme";
 
 /**
  * Read the theme from localStorage (the "external store").
@@ -90,16 +90,17 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // render and re-renders when `subscribe`'s callback fires.
   const theme = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 
-  // Apply the `dark` class to <html> whenever the theme changes.
-  // This effect ONLY writes to the DOM — it doesn't call setState,
-  // so it's perfectly fine.
+  // Keep the `dark` class on <html> in step with the theme.  This
+  // effect ONLY writes to the DOM — it doesn't call setState, so it's
+  // perfectly fine.
+  //
+  // It applies the store's value, not `theme`: during hydration `theme`
+  // is the server snapshot ("light"), and applying that strips the class
+  // the inline script set; the follow-up render restores it.  React
+  // happens to do both before the next paint, but each toggle restyles
+  // the whole document, and nothing guarantees the timing.
   useEffect(() => {
-    const root = document.documentElement;
-    if (theme === "dark") {
-      root.classList.add("dark");
-    } else {
-      root.classList.remove("dark");
-    }
+    document.documentElement.classList.toggle("dark", getSnapshot() === "dark");
   }, [theme]);
 
   function toggleTheme() {

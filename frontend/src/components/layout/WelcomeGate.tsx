@@ -1,23 +1,35 @@
 "use client";
 
 /**
- * Welcome screen gate — wraps the entire app layout.
+ * Welcome screen gate — wraps the page content inside `<main>`.
  *
- * When the backend requires per-session EDGAR credentials
- * (`edgar_session_required: true` in status response), this component
- * renders a form instead of the app.  Once the user provides their
- * SEC EDGAR name and email, the credentials are stored in
- * `sessionStorage` and the app is shown.
+ * Only the ingest endpoints use EDGAR credentials, so only the ingest
+ * page is gated.  When the backend requires per-session credentials
+ * (`edgar_session_required: true` in the status response) and this tab
+ * has none, the gate renders a form in place of that page.  Once the
+ * user provides their SEC EDGAR name and email, the credentials are
+ * stored in `sessionStorage` and the page is shown.
  *
- * When session credentials are **not** required (Scenario A with
- * server-side env vars), the gate is transparent — children render
- * immediately.
+ * The gate never blocks first paint: the page renders while
+ * `/api/status/` loads (the API may be cold-starting), if the request
+ * fails, and whenever credentials are **not** required (Scenario A with
+ * server-side env vars).  The navbar and footer sit outside it.
  */
 
 import { type SubmitEvent, useState, type ReactNode } from "react";
+import { usePathname } from "next/navigation";
 import { useEdgarSession } from "@/hooks/useEdgarSession";
 import { useStatus } from "@/hooks/useStatus";
-import { Button, Spinner } from "@/components/ui";
+import { Button } from "@/components/ui";
+
+/** Routes whose API calls need EDGAR credentials. */
+const GATED_ROUTES = ["/ingest"];
+
+function needsEdgarCredentials(pathname: string | null): boolean {
+  return GATED_ROUTES.some(
+    (route) => pathname === route || pathname?.startsWith(`${route}/`),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -28,37 +40,22 @@ interface WelcomeGateProps {
 }
 
 export function WelcomeGate({ children }: WelcomeGateProps) {
-  const { data: status, isLoading, isError } = useStatus();
+  const pathname = usePathname();
+  const { data: status } = useStatus();
   const { isAuthenticated, login } = useEdgarSession();
 
-  // If the status endpoint hasn't loaded yet, show a spinner.
-  if (isLoading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center">
-        <Spinner size="lg" />
-      </div>
-    );
+  // Show the form only once the server has said credentials are needed
+  // (`status` is undefined while loading and after an error — the pages
+  // have their own error handling), and only on a gated route.
+  if (
+    needsEdgarCredentials(pathname) &&
+    status?.edgar_session_required === true &&
+    !isAuthenticated
+  ) {
+    return <WelcomeForm onLogin={login} />;
   }
 
-  // On error, let the app through — the real pages have their own
-  // error handling.  We don't want the Welcome gate to permanently
-  // block the app if the backend is temporarily down.
-  if (isError || !status) {
-    return <>{children}</>;
-  }
-
-  // If the server says session credentials are not required, skip the gate.
-  if (!status.edgar_session_required) {
-    return <>{children}</>;
-  }
-
-  // If the user already has credentials in sessionStorage, let them through.
-  if (isAuthenticated) {
-    return <>{children}</>;
-  }
-
-  // Show the Welcome form.
-  return <WelcomeForm onLogin={login} />;
+  return <>{children}</>;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +78,7 @@ function WelcomeForm({ onLogin }: WelcomeFormProps) {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
+    <div className="flex min-h-[60vh] items-center justify-center">
       <div className="mx-auto w-full max-w-md space-y-8 rounded-2xl border border-hairline bg-card/80 p-8 shadow-2xl backdrop-blur-xl">
         {/* Header */}
         <div className="space-y-3 text-center">
