@@ -88,6 +88,18 @@ class TestConstants:
         for module in (constants_module, config_package):
             assert not shadowed & set(vars(module))
 
+    def test_frontend_form_types_match(self):
+        """The UI's form-type chips list exactly the forms the pipeline accepts."""
+        import re
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[2] / "frontend/src/lib/ui-constants.ts"
+        ).read_text()
+        declared = re.search(r"export const FORM_TYPES = \[(.*?)\] as const;", source, re.S)
+        assert declared is not None
+        assert tuple(re.findall(r'"([^"]+)"', declared.group(1))) == SUPPORTED_FORMS
+
     def test_default_form_types_value(self):
         """DEFAULT_FORM_TYPES must list both supported forms."""
         assert DEFAULT_FORM_TYPES == "10-K,10-Q"

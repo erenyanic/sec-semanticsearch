@@ -33,6 +33,14 @@
 import { useId, useState, type ReactNode } from "react";
 import { SlidersHorizontal, X } from "lucide-react";
 import { Badge } from "@/components/ui";
+import {
+  CHIP_ACTIVE,
+  CHIP_BASE,
+  CHIP_INACTIVE,
+  FIELD_LABEL,
+  FORM_TYPES,
+  INPUT_CLASS,
+} from "@/lib/ui-constants";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -93,31 +101,15 @@ export function countActiveFilters(filters: SearchFilterValues): number {
 }
 
 // ---------------------------------------------------------------------------
-// Chip styles
+// Styles (shared parts in lib/ui-constants.ts)
 // ---------------------------------------------------------------------------
 
-const CHIP_BASE =
-  "inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium " +
-  "transition-all cursor-pointer select-none";
-
-const CHIP_ACTIVE =
-  "border-accent/50 bg-accent/15 text-accent hover:bg-accent/20";
-
-const CHIP_INACTIVE =
-  "border-hairline bg-card text-fg-muted hover:border-accent/40 hover:text-fg";
-
-// Input field styles shared by number, text, date inputs
-const INPUT_CLASS =
-  "w-full rounded-lg border border-hairline bg-card px-3.5 py-2.5 text-sm text-fg " +
-  "placeholder:text-fg-subtle outline-none transition-colors " +
-  "focus:border-accent focus:ring-2 focus:ring-accent/20";
+// Filter chips are compact.
+const CHIP = CHIP_BASE + " gap-1.5 px-3 py-1.5";
 
 // Group heading style (used in rail mode)
 const GROUP_HEADING =
   "mb-3 text-sm font-semibold text-fg-muted";
-
-// Field label style
-const FIELD_LABEL = "text-sm font-medium text-fg-muted";
 
 // ---------------------------------------------------------------------------
 // Main component
@@ -293,7 +285,7 @@ function FilterControls({
                     key={t}
                     type="button"
                     onClick={() => toggleTicker(t)}
-                    className={`${CHIP_BASE} ${isActive ? CHIP_ACTIVE : CHIP_INACTIVE}`}
+                    className={`${CHIP} ${isActive ? CHIP_ACTIVE : CHIP_INACTIVE}`}
                     aria-pressed={isActive}
                   >
                     {t}
@@ -307,14 +299,14 @@ function FilterControls({
 
         <ChipGroup label="Form type">
           <div className="flex flex-wrap gap-1.5" role="group" aria-label="Form type filters">
-            {["8-K", "8-K/A", "10-K", "10-K/A", "10-Q", "10-Q/A"].map((f) => {
+            {FORM_TYPES.map((f) => {
               const isActive = filters.formTypes.includes(f);
               return (
                 <button
                   key={f}
                   type="button"
                   onClick={() => toggleFormType(f)}
-                  className={`${CHIP_BASE} ${isActive ? CHIP_ACTIVE : CHIP_INACTIVE}`}
+                  className={`${CHIP} ${isActive ? CHIP_ACTIVE : CHIP_INACTIVE}`}
                   aria-pressed={isActive}
                 >
                   {f}

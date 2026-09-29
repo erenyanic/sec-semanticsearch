@@ -38,7 +38,6 @@
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { produce } from "immer";
 import {
   ingestAdd,
   ingestBatch,
@@ -162,203 +161,241 @@ function hasFilingEvent(
   );
 }
 
+/** Add a filing event row. */
+function withEvent(state: IngestState, event: FilingEvent): IngestState {
+  return { ...state, filingEvents: [...state.filingEvents, event] };
+}
+
 /**
  * Exported for direct unit testing — not part of the public hook API.
  *
- * Wrapped with immer's `produce` so that append-heavy actions
- * (FILING_DONE, FILING_SKIPPED, FILING_FAILED) use O(1) `.push()`
- * instead of O(n) array spreads, avoiding O(n²) total allocations
- * over a batch of N filings.
+ * Plain immutable updates: a batch holds at most a few hundred filings,
+ * so copying the arrays per message costs nothing measurable, and the
+ * ingest page no longer ships a draft-state library for one reducer.
  */
-export const reducer = produce(
-  (draft: IngestState, action: IngestAction): IngestState | void => {
-    switch (action.type) {
-      case "START":
-        // Full reset — return a new object (immer replaces the draft).
-        return {
-          ...INITIAL_STATE,
-          taskId: action.taskId,
-          status: "pending",
-          startedAt: new Date(),
-        };
+export function reducer(state: IngestState, action: IngestAction): IngestState {
+  switch (action.type) {
+    case "START":
+      return {
+        ...INITIAL_STATE,
+        taskId: action.taskId,
+        status: "pending",
+        startedAt: new Date(),
+      };
 
-      case "SNAPSHOT": {
-        const mappedStatus =
+    case "SNAPSHOT":
+      return {
+        ...state,
+        status:
           action.status === "pending" || action.status === "running"
-            ? (action.status as "pending" | "running")
-            : draft.status;
-        draft.status = mappedStatus;
-        draft.progress = action.progress;
-        draft.results = action.results;
-        draft.lastSeq = action.seq ?? 0;
-        break;
+            ? action.status
+            : state.status,
+        progress: action.progress,
+        results: action.results,
+        lastSeq: action.seq ?? 0,
+      };
+
+    case "STEP":
+      // A replayed step is older than the snapshot's own step.
+      if (isReplay(state, action.seq)) return state;
+      return {
+        ...state,
+        status: "running",
+        progress: {
+          ...state.progress,
+          step_label: action.step,
+          step_index: action.step_number, // already 0-based
+          step_total: action.total_steps,
+          current_ticker: action.ticker ?? state.progress.current_ticker,
+          current_form_type: action.form_type ?? state.progress.current_form_type,
+        },
+        lastSeq: action.seq ?? state.lastSeq,
+      };
+
+    case "FILING_DONE": {
+      const event: FilingEvent = {
+        type: "done",
+        ticker: action.ticker,
+        form_type: action.form_type,
+        filing_date: action.filing_date,
+        accession_number: action.accession_number,
+        segments: action.segments,
+        chunks: action.chunks,
+        time: action.time,
+      };
+      if (isReplay(state, action.seq)) {
+        return hasFilingEvent(state.filingEvents, "done", action.accession_number)
+          ? state
+          : withEvent(state, event);
       }
-
-      case "STEP":
-        // A replayed step is older than the snapshot's own step.
-        if (isReplay(draft, action.seq)) break;
-        draft.status = "running";
-        draft.progress.step_label = action.step;
-        draft.progress.step_index = action.step_number; // already 0-based
-        draft.progress.step_total = action.total_steps;
-        draft.progress.current_ticker = action.ticker ?? draft.progress.current_ticker;
-        draft.progress.current_form_type = action.form_type ?? draft.progress.current_form_type;
-        draft.lastSeq = action.seq ?? draft.lastSeq;
-        break;
-
-      case "FILING_DONE":
-        if (isReplay(draft, action.seq)) {
-          if (hasFilingEvent(draft.filingEvents, "done", action.accession_number)) break;
-        } else {
-          draft.progress.filings_done += 1;
-          draft.results.push({
-            ticker: action.ticker,
-            form_type: action.form_type,
-            filing_date: action.filing_date,
-            accession_number: action.accession_number,
-            segments: action.segments,
-            chunks: action.chunks,
-            time: action.time,
-          });
-          draft.lastSeq = action.seq ?? draft.lastSeq;
-        }
-        draft.filingEvents.push({
-          type: "done",
-          ticker: action.ticker,
-          form_type: action.form_type,
-          filing_date: action.filing_date,
-          accession_number: action.accession_number,
-          segments: action.segments,
-          chunks: action.chunks,
-          time: action.time,
-        });
-        break;
-
-      case "FILING_SKIPPED":
-        if (isReplay(draft, action.seq)) {
-          if (hasFilingEvent(draft.filingEvents, "skipped", action.accession_number)) break;
-        } else {
-          draft.progress.filings_skipped += 1;
-          draft.lastSeq = action.seq ?? draft.lastSeq;
-        }
-        draft.filingEvents.push({
-          type: "skipped",
-          ticker: action.ticker,
-          form_type: action.form_type,
-          accession_number: action.accession_number,
-          reason: action.reason,
-        });
-        break;
-
-      case "FILING_FAILED":
-        if (isReplay(draft, action.seq)) {
-          if (hasFilingEvent(draft.filingEvents, "failed", action.accession_number)) break;
-        } else {
-          draft.progress.filings_failed += 1;
-          draft.lastSeq = action.seq ?? draft.lastSeq;
-        }
-        draft.filingEvents.push({
-          type: "failed",
-          ticker: action.ticker,
-          form_type: action.form_type,
-          accession_number: action.accession_number,
-          error: action.error,
-        });
-        break;
-
-      case "EVICTION":
-        if (isReplay(draft, action.seq)) {
-          const seen = draft.filingEvents.some(
-            (e) =>
-              e.type === "eviction" &&
-              e.filings_evicted === action.filings_evicted &&
-              e.chunks_evicted === action.chunks_evicted,
-          );
-          if (seen) break;
-        } else {
-          draft.lastSeq = action.seq ?? draft.lastSeq;
-        }
-        draft.filingEvents.push({
-          type: "eviction",
-          ticker: action.tickers_affected.join(", ") || "—",
-          form_type: "",
-          filings_evicted: action.filings_evicted,
-          chunks_evicted: action.chunks_evicted,
-          tickers_affected: action.tickers_affected,
-        });
-        break;
-
-      case "COMPLETED":
-        draft.status = "completed";
-        draft.results = action.results;
-        draft.summary = action.summary;
-        draft.completedAt = new Date();
-        break;
-
-      case "FAILED":
-        draft.status = "failed";
-        draft.error = action.details ? `${action.error}: ${action.details}` : action.error;
-        draft.completedAt = new Date();
-        break;
-
-      case "CANCELLED":
-        draft.status = "cancelled";
-        draft.summary = {
-          total: draft.progress.filings_done + draft.progress.filings_skipped + draft.progress.filings_failed,
-          succeeded: draft.progress.filings_done,
-          skipped: draft.progress.filings_skipped,
-          failed: draft.progress.filings_failed,
-        };
-        draft.completedAt = new Date();
-        break;
-
-      case "ERROR":
-        draft.status = "failed";
-        draft.error = action.error;
-        draft.completedAt = new Date();
-        break;
-
-      case "RESUME": {
-        const ts = action.taskStatus;
-        // Convert IngestResult[] from REST API to WsFilingResult[] shape.
-        const wsResults: WsFilingResult[] = ts.results.map((r) => ({
-          ticker: r.ticker,
-          form_type: r.form_type,
-          filing_date: r.filing_date,
-          accession_number: r.accession_number,
-          segments: r.segment_count,
-          chunks: r.chunk_count,
-          time: r.duration_seconds,
-        }));
-        // Reconstruct filing events from results (done events only —
-        // we cannot recover skip/fail events from the REST snapshot,
-        // but the WebSocket snapshot will fill them in on reconnect).
-        const events: FilingEvent[] = ts.results.map((r) => ({
-          type: "done" as const,
-          ticker: r.ticker,
-          form_type: r.form_type,
-          filing_date: r.filing_date,
-          accession_number: r.accession_number,
-          segments: r.segment_count,
-          chunks: r.chunk_count,
-          time: r.duration_seconds,
-        }));
-        return {
-          ...INITIAL_STATE,
-          taskId: ts.task_id,
-          status: ts.status === "pending" || ts.status === "running" ? ts.status : "idle",
-          progress: ts.progress,
-          results: wsResults,
-          filingEvents: events,
-          startedAt: ts.started_at ? new Date(ts.started_at) : new Date(),
-        };
-      }
-
-      case "RESET":
-        return INITIAL_STATE;
+      return withEvent(
+        {
+          ...state,
+          progress: { ...state.progress, filings_done: state.progress.filings_done + 1 },
+          results: [
+            ...state.results,
+            {
+              ticker: action.ticker,
+              form_type: action.form_type,
+              filing_date: action.filing_date,
+              accession_number: action.accession_number,
+              segments: action.segments,
+              chunks: action.chunks,
+              time: action.time,
+            },
+          ],
+          lastSeq: action.seq ?? state.lastSeq,
+        },
+        event,
+      );
     }
-  },
-);
+
+    case "FILING_SKIPPED": {
+      const event: FilingEvent = {
+        type: "skipped",
+        ticker: action.ticker,
+        form_type: action.form_type,
+        accession_number: action.accession_number,
+        reason: action.reason,
+      };
+      if (isReplay(state, action.seq)) {
+        return hasFilingEvent(state.filingEvents, "skipped", action.accession_number)
+          ? state
+          : withEvent(state, event);
+      }
+      return withEvent(
+        {
+          ...state,
+          progress: { ...state.progress, filings_skipped: state.progress.filings_skipped + 1 },
+          lastSeq: action.seq ?? state.lastSeq,
+        },
+        event,
+      );
+    }
+
+    case "FILING_FAILED": {
+      const event: FilingEvent = {
+        type: "failed",
+        ticker: action.ticker,
+        form_type: action.form_type,
+        accession_number: action.accession_number,
+        error: action.error,
+      };
+      if (isReplay(state, action.seq)) {
+        return hasFilingEvent(state.filingEvents, "failed", action.accession_number)
+          ? state
+          : withEvent(state, event);
+      }
+      return withEvent(
+        {
+          ...state,
+          progress: { ...state.progress, filings_failed: state.progress.filings_failed + 1 },
+          lastSeq: action.seq ?? state.lastSeq,
+        },
+        event,
+      );
+    }
+
+    case "EVICTION": {
+      const event: FilingEvent = {
+        type: "eviction",
+        ticker: action.tickers_affected.join(", ") || "—",
+        form_type: "",
+        filings_evicted: action.filings_evicted,
+        chunks_evicted: action.chunks_evicted,
+        tickers_affected: action.tickers_affected,
+      };
+      if (isReplay(state, action.seq)) {
+        const seen = state.filingEvents.some(
+          (e) =>
+            e.type === "eviction" &&
+            e.filings_evicted === action.filings_evicted &&
+            e.chunks_evicted === action.chunks_evicted,
+        );
+        return seen ? state : withEvent(state, event);
+      }
+      return withEvent({ ...state, lastSeq: action.seq ?? state.lastSeq }, event);
+    }
+
+    case "COMPLETED":
+      return {
+        ...state,
+        status: "completed",
+        results: action.results,
+        summary: action.summary,
+        completedAt: new Date(),
+      };
+
+    case "FAILED":
+      return {
+        ...state,
+        status: "failed",
+        error: action.details ? `${action.error}: ${action.details}` : action.error,
+        completedAt: new Date(),
+      };
+
+    case "CANCELLED":
+      return {
+        ...state,
+        status: "cancelled",
+        summary: {
+          total:
+            state.progress.filings_done +
+            state.progress.filings_skipped +
+            state.progress.filings_failed,
+          succeeded: state.progress.filings_done,
+          skipped: state.progress.filings_skipped,
+          failed: state.progress.filings_failed,
+        },
+        completedAt: new Date(),
+      };
+
+    case "ERROR":
+      return { ...state, status: "failed", error: action.error, completedAt: new Date() };
+
+    case "RESUME": {
+      const ts = action.taskStatus;
+      // Convert IngestResult[] from REST API to WsFilingResult[] shape.
+      const wsResults: WsFilingResult[] = ts.results.map((r) => ({
+        ticker: r.ticker,
+        form_type: r.form_type,
+        filing_date: r.filing_date,
+        accession_number: r.accession_number,
+        segments: r.segment_count,
+        chunks: r.chunk_count,
+        time: r.duration_seconds,
+      }));
+      // Reconstruct filing events from results (done events only —
+      // skip/fail events are not in the REST task status; the WebSocket
+      // replays any still queued, see "Reconnection" above).
+      const events: FilingEvent[] = ts.results.map((r) => ({
+        type: "done" as const,
+        ticker: r.ticker,
+        form_type: r.form_type,
+        filing_date: r.filing_date,
+        accession_number: r.accession_number,
+        segments: r.segment_count,
+        chunks: r.chunk_count,
+        time: r.duration_seconds,
+      }));
+      return {
+        ...INITIAL_STATE,
+        taskId: ts.task_id,
+        status: ts.status === "pending" || ts.status === "running" ? ts.status : "idle",
+        progress: ts.progress,
+        results: wsResults,
+        filingEvents: events,
+        startedAt: ts.started_at ? new Date(ts.started_at) : new Date(),
+      };
+    }
+
+    case "RESET":
+      return INITIAL_STATE;
+
+    default:
+      return state;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Hook

@@ -24,6 +24,14 @@ import { type SubmitEvent, type KeyboardEvent, useId, useState } from "react";
 import { Upload, X, ChevronDown, ChevronUp, Calendar } from "lucide-react";
 import { Button, useToast } from "@/components/ui";
 import type { IngestRequest } from "@/lib/types";
+import {
+  CHIP_ACTIVE,
+  CHIP_BASE,
+  CHIP_INACTIVE,
+  FIELD_LABEL,
+  FORM_TYPES,
+  INPUT_CLASS,
+} from "@/lib/ui-constants";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -39,8 +47,6 @@ interface IngestFormProps {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const FORM_TYPES = ["8-K", "8-K/A", "10-K", "10-K/A", "10-Q", "10-Q/A"] as const;
 
 /** Descriptions shown beneath each count mode radio option. */
 const COUNT_MODE_INFO: Record<string, { label: string; description: string }> = {
@@ -59,27 +65,15 @@ const COUNT_MODE_INFO: Record<string, { label: string; description: string }> = 
 };
 
 // ---------------------------------------------------------------------------
-// Shared styles
+// Styles (shared parts in lib/ui-constants.ts)
 // ---------------------------------------------------------------------------
 
-const INPUT_CLASS =
-  "w-full rounded-lg border border-hairline bg-card px-3.5 py-2.5 text-sm text-fg " +
-  "tabular-nums placeholder:text-fg-subtle outline-none transition-colors " +
-  "focus:border-accent focus:ring-2 focus:ring-accent/25";
+// Numbers and dates line up; chips are larger than the search filters'.
+const INPUT = INPUT_CLASS + " tabular-nums";
 
 const SECTION_HEADING = "text-base font-semibold text-fg";
 
-const FIELD_LABEL = "text-sm font-medium text-fg-muted";
-
-const CHIP_BASE =
-  "inline-flex items-center gap-1 rounded-lg border px-3.5 py-2 text-sm font-medium " +
-  "transition-all cursor-pointer select-none tabular-nums";
-
-const CHIP_ACTIVE =
-  "border-accent/60 bg-accent/15 text-accent hover:bg-accent/20";
-
-const CHIP_INACTIVE =
-  "border-hairline bg-card text-fg-muted hover:border-accent/40 hover:text-fg";
+const CHIP = CHIP_BASE + " gap-1 px-3.5 py-2 tabular-nums";
 
 // ---------------------------------------------------------------------------
 // Component
@@ -249,7 +243,7 @@ export function IngestForm({ onSubmit, isSubmitting }: IngestFormProps) {
                 type="button"
                 onClick={() => toggleFormType(ft)}
                 aria-pressed={isActive}
-                className={`${CHIP_BASE} ${isActive ? CHIP_ACTIVE : CHIP_INACTIVE}`}
+                className={`${CHIP} ${isActive ? CHIP_ACTIVE : CHIP_INACTIVE}`}
               >
                 {ft}
               </button>
@@ -313,7 +307,7 @@ export function IngestForm({ onSubmit, isSubmitting }: IngestFormProps) {
                 value={count}
                 onChange={(e) => setCount(e.target.value)}
                 placeholder="e.g. 3"
-                className={`${INPUT_CLASS} w-36`}
+                className={`${INPUT} w-36`}
               />
             </label>
           )}
@@ -354,7 +348,7 @@ export function IngestForm({ onSubmit, isSubmitting }: IngestFormProps) {
                 value={year}
                 onChange={(e) => setYear(e.target.value)}
                 placeholder="e.g. 2024"
-                className={INPUT_CLASS}
+                className={INPUT}
               />
             </label>
 
@@ -364,7 +358,7 @@ export function IngestForm({ onSubmit, isSubmitting }: IngestFormProps) {
                 type="date"
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
-                className={INPUT_CLASS}
+                className={INPUT}
               />
             </label>
 
@@ -374,7 +368,7 @@ export function IngestForm({ onSubmit, isSubmitting }: IngestFormProps) {
                 type="date"
                 value={endDate}
                 onChange={(e) => setEndDate(e.target.value)}
-                className={INPUT_CLASS}
+                className={INPUT}
               />
             </label>
           </div>
