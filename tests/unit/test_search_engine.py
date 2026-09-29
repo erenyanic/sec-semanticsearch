@@ -7,8 +7,10 @@ Tests the engine's own logic in isolation (no real ChromaDB):
     - accession_number filter passthrough
     - Similarity threshold filtering
     - Default parameter usage from settings
+    - Query text never reaches the log output; ticker filters are redacted
 """
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -140,3 +142,59 @@ class TestDefaultParameters:
         engine.search("test", top_k=10)
         _, kwargs = mock_chroma.query.call_args
         assert kwargs["n_results"] == 10
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+@pytest.fixture
+def captured_logs():
+    """Every formatted message from the package loggers, at DEBUG and above."""
+    package_logger = logging.getLogger("sec_semantic_search")
+    handler = _Capture()
+    previous = package_logger.level
+    package_logger.addHandler(handler)
+    package_logger.setLevel(logging.DEBUG)
+    try:
+        yield handler.lines
+    finally:
+        package_logger.removeHandler(handler)
+        package_logger.setLevel(previous)
+
+
+class TestQueryPrivacy:
+    """Search queries are never persisted, including in logs (AD#29)."""
+
+    QUERY = "confidential acquisition target in semiconductor supply chain"
+
+    @pytest.mark.parametrize("redact", ["", "true"])
+    def test_query_text_never_logged(self, engine, captured_logs, monkeypatch, redact):
+        monkeypatch.setenv("LOG_REDACT_QUERIES", redact)
+        engine.search(self.QUERY)
+        assert captured_logs, "the engine should still log the search"
+        assert not any("confidential" in line for line in captured_logs)
+        assert not any(self.QUERY[:20] in line for line in captured_logs)
+
+    def test_query_not_logged_on_failure(self, engine, mock_embedder, captured_logs):
+        mock_embedder.embed_query_for_chromadb.side_effect = RuntimeError("boom")
+        with pytest.raises(SearchError):
+            engine.search(self.QUERY)
+        assert not any("confidential" in line for line in captured_logs)
+
+    def test_ticker_filter_redacted_when_enabled(self, engine, captured_logs, monkeypatch):
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "true")
+        engine.search("test", ticker=["NVDA", "AMD"])
+        joined = "\n".join(captured_logs)
+        assert "NVDA" not in joined and "AMD" not in joined
+        assert "<redacted:" in joined
+
+    def test_ticker_filter_logged_when_redaction_off(self, engine, captured_logs, monkeypatch):
+        monkeypatch.delenv("LOG_REDACT_QUERIES", raising=False)
+        engine.search("test", ticker="NVDA")
+        assert any("NVDA" in line for line in captured_logs)

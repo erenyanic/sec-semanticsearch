@@ -13,11 +13,26 @@ Usage:
 """
 
 from sec_semantic_search.config import get_settings
-from sec_semantic_search.core import EmbeddingBusyError, SearchError, SearchResult, get_logger
+from sec_semantic_search.core import (
+    EmbeddingBusyError,
+    SearchError,
+    SearchResult,
+    get_logger,
+    redact_for_log,
+)
 from sec_semantic_search.database import ChromaDBClient, MetadataRegistry
 from sec_semantic_search.pipeline import EmbeddingGenerator
 
 logger = get_logger(__name__)
+
+
+def _redact_filter(value: str | list[str] | None) -> str | list[str]:
+    """Return a ticker filter as it may appear in a log line."""
+    if not value:
+        return "any"
+    if isinstance(value, str):
+        return redact_for_log(value)
+    return [redact_for_log(v) for v in value]
 
 
 class SearchEngine:
@@ -134,12 +149,15 @@ class SearchEngine:
             min_similarity if min_similarity is not None else self._default_min_similarity
         )
 
+        # Never the query text: queries are not persisted (AD#29), and a log
+        # file or Cloud Logging would keep it. The API route logs it once,
+        # through ``redact_for_log``. Ticker filters reveal research interest
+        # too, so they follow the same redaction setting.
         logger.info(
-            "Searching: '%s' (top_k=%d, min_similarity=%.2f, ticker=%s, form_type=%s)",
-            query[:80],
+            "Searching (top_k=%d, min_similarity=%.2f, ticker=%s, form_type=%s)",
             effective_top_k,
             effective_min_sim,
-            ticker if ticker else "any",
+            _redact_filter(ticker),
             form_type if form_type else "any",
         )
 
