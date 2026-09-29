@@ -79,7 +79,8 @@ function splitForHighlight(
 /**
  * Map a 0–1 similarity to a {bar-color, label-color} pair.
  *
- * Thresholds match SimilarityBadge:
+ * The frontend's only copy of the thresholds; they match the CLI
+ * (`cli/search.py`, AD#12):
  *   ≥ 0.40 → strong match (pos/emerald)
  *   ≥ 0.25 → moderate     (warn/amber)
  *   <  0.25 → weak        (neg/red)

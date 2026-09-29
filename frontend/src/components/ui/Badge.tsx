@@ -16,7 +16,6 @@
  */
 
 import { type ReactNode } from "react";
-import type { TaskState } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -64,40 +63,4 @@ export function Badge({ variant = "gray", children, className }: BadgeProps) {
     .join(" ");
 
   return <span className={classes}>{children}</span>;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Maps a `TaskState` value from the API to the corresponding Badge
- * colour variant.
- *
- * This lives alongside Badge (rather than in a separate utils file)
- * because it is tightly coupled to Badge's variant set — if we add
- * or rename a variant, this function must update in tandem.
- *
- * Usage:
- * ```tsx
- * <Badge variant={taskStateToBadgeVariant(task.status)}>
- *   {task.status}
- * </Badge>
- * ```
- */
-export function taskStateToBadgeVariant(
-  state: TaskState,
-): NonNullable<BadgeProps["variant"]> {
-  switch (state) {
-    case "pending":
-      return "amber";
-    case "running":
-      return "blue";
-    case "completed":
-      return "green";
-    case "failed":
-      return "red";
-    case "cancelled":
-      return "red";
-  }
 }

@@ -2,9 +2,7 @@
  * Skeleton loading placeholder — shows a shimmer animation where
  * content will appear.
  *
- * Two exports:
- *   - `Skeleton`     — single block (cards, images, badges)
- *   - `SkeletonText` — multiple lines of varying width (paragraphs)
+ * One export, `Skeleton`: a single block sized by its classes.
  *
  * ## How the shimmer works
  *
@@ -58,47 +56,5 @@ export function Skeleton({ className }: SkeletonProps) {
         .filter(Boolean)
         .join(" ")}
     />
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Skeleton text (multiple lines)
-// ---------------------------------------------------------------------------
-
-interface SkeletonTextProps {
-  /** Number of text lines to render. Defaults to `3`. */
-  lines?: number;
-  /** Additional classes for the wrapper `<div>`. */
-  className?: string;
-}
-
-/**
- * Multiple skeleton lines mimicking a paragraph.
- *
- * Line widths cycle through 100% → 90% → 75% to look natural.
- * The last line is always shorter (60%) to mimic a paragraph ending
- * mid-line.
- *
- * ```tsx
- * <SkeletonText lines={4} />
- * ```
- */
-const LINE_WIDTHS = ["w-full", "w-[90%]", "w-3/4"];
-
-export function SkeletonText({ lines = 3, className }: SkeletonTextProps) {
-  return (
-    <div className={["space-y-2", className].filter(Boolean).join(" ")}>
-      {Array.from({ length: lines }, (_, i) => (
-        <Skeleton
-          key={i}
-          className={[
-            "h-4",
-            i === lines - 1
-              ? "w-3/5" // last line is shorter
-              : LINE_WIDTHS[i % LINE_WIDTHS.length],
-          ].join(" ")}
-        />
-      ))}
-    </div>
   );
 }

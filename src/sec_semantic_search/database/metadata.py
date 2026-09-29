@@ -421,30 +421,6 @@ class MetadataRegistry:
         if current >= self._max_filings:
             raise FilingLimitExceededError(current, self._max_filings)
 
-    def is_duplicate(self, accession_number: str) -> bool:
-        """
-        Check whether a filing has already been ingested.
-
-        Args:
-            accession_number: SEC accession number to check.
-
-        Returns:
-            True if the filing exists in the registry.
-
-        Raises:
-            DatabaseError: If the query fails.
-        """
-        sql = "SELECT 1 FROM filings WHERE accession_number = ? LIMIT 1"
-        try:
-            with self._read_lock:
-                row = self._read_conn.execute(sql, (accession_number,)).fetchone()
-            return row is not None
-        except self._db_error as e:
-            raise DatabaseError(
-                "Failed to check for duplicate filing",
-                details=str(e),
-            ) from e
-
     def get_existing_accessions(
         self,
         accession_numbers: list[str],
@@ -452,9 +428,8 @@ class MetadataRegistry:
         """
         Return the subset of accession numbers that already exist in the registry.
 
-        Performs a single ``SELECT ... WHERE IN (...)`` query instead of
-        N individual ``is_duplicate()`` calls, reducing SQLite connection
-        overhead from O(N) to O(1) for batch operations.
+        Performs a single ``SELECT ... WHERE IN (...)`` query rather than
+        one lookup per filing, so a batch costs one round-trip.
 
         Args:
             accession_numbers: Accession numbers to check.
@@ -562,7 +537,7 @@ class MetadataRegistry:
 
         Holds the threading lock across both the duplicate check and the
         insert, closing the race window where two threads could both pass
-        ``is_duplicate()`` and then both attempt ``register_filing()``.
+        the batch duplicate check and then both attempt ``register_filing()``.
 
         When ``segments`` is provided, the filing row and segment rows
         are inserted in the same transaction so the parent-context store
@@ -1316,28 +1291,6 @@ class MetadataRegistry:
                 result[(row["accession_number"], row["segment_index"])] = row["content"]
 
         return result
-
-    def count_segments(self, accession_number: str | None = None) -> int:
-        """Count rows in the segments table (optionally filtered).
-
-        Mainly for tests and diagnostics — the production search path uses
-        ``get_parent_segments`` for batched lookups instead.
-        """
-        if accession_number is None:
-            sql = "SELECT COUNT(*) FROM segments"
-            params: tuple = ()
-        else:
-            sql = "SELECT COUNT(*) FROM segments WHERE accession_number = ?"
-            params = (accession_number,)
-        try:
-            with self._read_lock:
-                row = self._read_conn.execute(sql, params).fetchone()
-            return row[0]
-        except self._db_error as e:
-            raise DatabaseError(
-                "Failed to count segments",
-                details=str(e),
-            ) from e
 
     # ------------------------------------------------------------------
     # Internal helpers

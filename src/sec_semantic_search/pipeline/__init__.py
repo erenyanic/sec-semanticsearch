@@ -6,7 +6,7 @@ This module provides the complete ingestion pipeline for SEC filings:
     - FilingParser: Parse HTML into semantic segments
     - TextChunker: Split segments into embedding-ready chunks
     - EmbeddingGenerator: Generate vector embeddings
-    - PipelineOrchestrator: Coordinate the full pipeline
+    - PipelineOrchestrator: Parse, chunk and embed one fetched filing
 
 Usage:
     from sec_semantic_search.pipeline import (
@@ -17,13 +17,9 @@ Usage:
         PipelineOrchestrator,
     )
 
-    # High-level usage with orchestrator
-    orchestrator = PipelineOrchestrator()
-    result = orchestrator.ingest_latest("AAPL", "10-K")
-
-    # Low-level usage with individual components
-    fetcher = FilingFetcher()
-    filing_id, html = fetcher.fetch_latest("AAPL", "10-K")
+    # Fetch, then parse → chunk → embed (storage is the database module's job)
+    filing_id, html = FilingFetcher().fetch_latest("AAPL", "10-K")
+    result = PipelineOrchestrator().process_filing(filing_id, html)
 """
 
 from sec_semantic_search.pipeline.chunk import TextChunker

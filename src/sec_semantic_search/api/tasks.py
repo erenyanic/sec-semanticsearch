@@ -9,8 +9,9 @@ single-user portfolio project running on a GTX 1650 (4 GB VRAM):
       execution; additional tasks queue in FIFO order.
     - **Cancel via ``threading.Event``** — checked between pipeline steps;
       partial data is rolled back on cancellation.
-    - **Task cleanup** — completed/failed/cancelled tasks are pruned after
-      one hour by a background timer.
+    - **Task cleanup** — completed/failed/cancelled tasks are persisted to
+      SQLite task history and pruned from memory after 24 hours by a
+      background timer; lookups fall back to the history.
     - **Progress callback** — the pipeline's ``progress_callback`` feeds
       directly into the task's ``TaskProgress`` snapshot.
 
@@ -654,8 +655,7 @@ class TaskManager:
 
         info.progress.filings_total = len(work)
 
-        # Batch duplicate check — single SQL query instead of N individual
-        # is_duplicate() calls, reducing SQLite round-trips from O(N) to O(1).
+        # Batch duplicate check — one SQL query for the whole work list.
         all_accessions = [fi.accession_number for fi in work]
         existing = self._registry.get_existing_accessions(all_accessions)
 
@@ -879,8 +879,8 @@ class TaskManager:
                 try:
                     # Atomic check-then-insert: holds the SQLite lock across
                     # both the duplicate check and the INSERT, preventing the
-                    # race window where two threads both pass is_duplicate()
-                    # and then both attempt to register the same filing.
+                    # race window where two threads both pass the batch
+                    # duplicate check and then both register the same filing.
                     # SQLite registration is done first so that a late
                     # duplicate is caught before writing to ChromaDB.
                     registered = self._registry.register_filing_if_new(

@@ -215,11 +215,11 @@ class TestEncryptedMode:
         assert registry.count() == 0
 
     def test_duplicate_detection_encrypted(self, registry):
-        """is_duplicate and register_filing_if_new work in encrypted mode."""
+        """Duplicate lookup and register_filing_if_new work in encrypted mode."""
         fid = FilingIdentifier("GOOGL", "10-K", date(2024, 1, 1), "ACC-ENC-DUP")
-        assert registry.is_duplicate("ACC-ENC-DUP") is False
+        assert registry.get_existing_accessions(["ACC-ENC-DUP"]) == set()
         registry.register_filing(fid, chunk_count=50)
-        assert registry.is_duplicate("ACC-ENC-DUP") is True
+        assert registry.get_existing_accessions(["ACC-ENC-DUP"]) == {"ACC-ENC-DUP"}
 
         result = registry.register_filing_if_new(fid, chunk_count=50)
         assert result is False

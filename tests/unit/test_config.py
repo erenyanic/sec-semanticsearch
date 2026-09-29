@@ -14,14 +14,8 @@ from sec_semantic_search.config.constants import (
     AMENDMENT_FORMS,
     BASE_FORMS,
     COLLECTION_NAME,
-    DEFAULT_CHUNK_TOKEN_LIMIT,
-    DEFAULT_CHUNK_TOLERANCE,
     DEFAULT_FORM_TYPES,
-    DEFAULT_MAX_FILINGS,
-    DEFAULT_MIN_SIMILARITY,
-    DEFAULT_SEARCH_TOP_K,
     EMBEDDING_DIMENSION,
-    EMBEDDING_MODEL_NAME,
     SUPPORTED_FORMS,
     parse_form_types,
 )
@@ -72,22 +66,27 @@ class TestConstants:
         """Must match google/embeddinggemma-300m's output dimension."""
         assert EMBEDDING_DIMENSION == 768
 
-    def test_embedding_model_name(self):
-        assert EMBEDDING_MODEL_NAME == "google/embeddinggemma-300m"
-
     def test_collection_name(self):
         assert COLLECTION_NAME == "sec_filings"
 
-    def test_default_chunk_limits(self):
-        assert DEFAULT_CHUNK_TOKEN_LIMIT == 500
-        assert DEFAULT_CHUNK_TOLERANCE == 50
+    def test_no_default_constants_shadow_settings(self):
+        """Defaults live on the settings classes only; the copies here had
+        drifted (DEFAULT_MAX_FILINGS was 500 against the 2,500 setting)."""
+        import sec_semantic_search.config as config_package
+        import sec_semantic_search.config.constants as constants_module
 
-    def test_default_search_values(self):
-        assert DEFAULT_SEARCH_TOP_K == 5
-        assert DEFAULT_MIN_SIMILARITY == 0.0
-
-    def test_default_max_filings(self):
-        assert DEFAULT_MAX_FILINGS == 500
+        shadowed = {
+            "EMBEDDING_MODEL_NAME",
+            "DEFAULT_CHUNK_TOKEN_LIMIT",
+            "DEFAULT_CHUNK_TOLERANCE",
+            "DEFAULT_CHROMADB_PATH",
+            "DEFAULT_METADATA_DB_PATH",
+            "DEFAULT_MAX_FILINGS",
+            "DEFAULT_SEARCH_TOP_K",
+            "DEFAULT_MIN_SIMILARITY",
+        }
+        for module in (constants_module, config_package):
+            assert not shadowed & set(vars(module))
 
     def test_default_form_types_value(self):
         """DEFAULT_FORM_TYPES must list both supported forms."""

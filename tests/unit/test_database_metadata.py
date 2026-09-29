@@ -177,7 +177,7 @@ class TestSQLInjectionSafety:
 
     def test_accession_with_special_characters(self, registry, stored_filing):
         """Special characters in accession number should not break queries."""
-        assert registry.is_duplicate("' OR '1'='1") is False
+        assert registry.get_existing_accessions(["' OR '1'='1"]) == set()
         assert registry.get_filing("' UNION SELECT * FROM filings --") is None
 
     def test_count_with_sql_injection(self, registry, stored_filing):

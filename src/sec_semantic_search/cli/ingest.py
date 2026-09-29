@@ -208,8 +208,7 @@ def _ingest_one_form(
     skipped = 0
     failed = 0
 
-    # Batch duplicate check — single SQL query instead of N individual
-    # is_duplicate() calls, reducing SQLite round-trips from O(N) to O(1).
+    # Batch duplicate check — one SQL query for the whole work list.
     existing = registry.get_existing_accessions([fid.accession_number for fid, _ in filings])
 
     for filing_idx, (filing_id, html_content) in enumerate(filings):
@@ -385,8 +384,7 @@ def _ingest_across_forms(
     skipped = 0
     failed = 0
 
-    # Batch duplicate check — single SQL query instead of N individual
-    # is_duplicate() calls, reducing SQLite round-trips from O(N) to O(1).
+    # Batch duplicate check — one SQL query for the whole work list.
     existing = registry.get_existing_accessions([fi.accession_number for fi in selected])
 
     with _make_progress() as progress:
@@ -582,7 +580,7 @@ def add(
     registry = MetadataRegistry()
     chroma = ChromaDBClient()
     fetcher = FilingFetcher()
-    orchestrator = PipelineOrchestrator(fetcher=fetcher)
+    orchestrator = PipelineOrchestrator()
 
     # --- Cross-form mode: -t (total across form types) -----------------------
     if total is not None:
@@ -785,7 +783,7 @@ def batch(
     registry = MetadataRegistry()
     chroma = ChromaDBClient()
     fetcher = FilingFetcher()
-    orchestrator = PipelineOrchestrator(fetcher=fetcher)
+    orchestrator = PipelineOrchestrator()
 
     total_succeeded = 0
     total_skipped = 0

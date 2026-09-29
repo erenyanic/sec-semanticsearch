@@ -17,16 +17,11 @@ import axios, { AxiosError } from "axios";
 import type {
   AdminSessionResponse,
   ApiError,
-  BulkDeleteRequest,
-  BulkDeleteResponse,
   ClearAllResponse,
   DeleteByIdsRequest,
   DeleteByIdsResponse,
   DeleteResponse,
-  Filing,
   FilingListResponse,
-  GPUStatusResponse,
-  GPUUnloadResponse,
   IngestRequest,
   ParentSegment,
   SearchRequest,
@@ -35,7 +30,6 @@ import type {
   StatusResponse,
   TaskListResponse,
   TaskResponse,
-  TaskStatus,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -160,14 +154,6 @@ export async function getFilings(
   return data;
 }
 
-/** Get a single filing by accession number. */
-export async function getFiling(accessionNumber: string): Promise<Filing> {
-  const { data } = await client.get<Filing>(
-    `/api/filings/${encodeURIComponent(accessionNumber)}`,
-  );
-  return data;
-}
-
 /** Delete a single filing. */
 export async function deleteFiling(
   accessionNumber: string,
@@ -185,17 +171,6 @@ export async function deleteFilingsByIds(
   const { data } = await client.post<DeleteByIdsResponse>(
     "/api/filings/delete-by-ids",
     { accession_numbers: accessionNumbers } satisfies DeleteByIdsRequest,
-  );
-  return data;
-}
-
-/** Bulk-delete filings by ticker and/or form type. */
-export async function bulkDeleteFilings(
-  body: BulkDeleteRequest,
-): Promise<BulkDeleteResponse> {
-  const { data } = await client.post<BulkDeleteResponse>(
-    "/api/admin/filings/bulk-delete",
-    body,
   );
   return data;
 }
@@ -286,43 +261,7 @@ export async function getTasks(): Promise<TaskListResponse> {
   return data;
 }
 
-/** Get status of a specific task. */
-export async function getTask(taskId: string): Promise<TaskStatus> {
-  const { data } = await client.get<TaskStatus>(
-    `/api/ingest/tasks/${encodeURIComponent(taskId)}`,
-  );
-  return data;
-}
-
 /** Cancel a running task. */
 export async function cancelTask(taskId: string): Promise<void> {
   await client.delete(`/api/ingest/tasks/${encodeURIComponent(taskId)}`);
-}
-
-// ---------------------------------------------------------------------------
-// GPU / Resources
-// ---------------------------------------------------------------------------
-
-/** Check GPU / embedding model status. */
-export async function getGPUStatus(): Promise<GPUStatusResponse> {
-  const { data } = await client.get<GPUStatusResponse>("/api/resources/gpu");
-  return data;
-}
-
-/** Unload the embedding model to free VRAM. */
-export async function unloadGPU(): Promise<GPUUnloadResponse> {
-  const { data } = await client.delete<GPUUnloadResponse>("/api/admin/resources/gpu");
-  return data;
-}
-
-// ---------------------------------------------------------------------------
-// Health
-// ---------------------------------------------------------------------------
-
-/** Simple liveness check. */
-export async function healthCheck(): Promise<{ status: string; version: string }> {
-  const { data } = await client.get<{ status: string; version: string }>(
-    "/api/health",
-  );
-  return data;
 }

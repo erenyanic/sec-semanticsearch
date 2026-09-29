@@ -914,8 +914,11 @@ class TestFrontendAdminKeyExposure:
         api_source = Path("frontend/src/lib/api.ts").read_text(encoding="utf-8")
 
         assert "NEXT_PUBLIC_ADMIN_KEY" not in api_source
-        assert "/api/admin/filings/bulk-delete" in api_source
-        assert "/api/admin/resources/gpu" in api_source
+        # Admin-only FastAPI endpoints are reached only through the
+        # server-side /api/admin/* proxies, never directly from the browser.
+        assert '"/api/filings/bulk-delete"' not in api_source
+        assert '"/api/resources/gpu"' not in api_source
+        assert 'client.delete<ClearAllResponse>("/api/admin/filings"' in api_source
 
     def test_frontend_uses_server_side_admin_routes(self):
         assert Path("frontend/src/app/api/admin/session/route.ts").exists()
@@ -1492,6 +1495,17 @@ class TestTaskPersistence:
 
         assert _TASK_TTL_SECONDS == 86_400
 
+    def test_route_hints_state_the_real_ttl(self):
+        """The 404 hints and docstrings must not promise a different TTL."""
+        from sec_semantic_search.api.tasks import _TASK_TTL_SECONDS
+
+        source = (
+            Path(__file__).parents[3] / "src/sec_semantic_search/api/routes/ingest.py"
+        ).read_text()
+        hours = _TASK_TTL_SECONDS // 3600
+        assert f"{hours}-hour TTL" in source
+        assert not re.search(rf"\b(?!{hours}-)\d+-hour TTL", source)
+
     def test_task_history_table_created(self, tmp_path, monkeypatch):
         """MetadataRegistry must create the task_history table."""
         monkeypatch.setenv("DB_METADATA_DB_PATH", str(tmp_path / "test.sqlite"))
@@ -2003,39 +2017,36 @@ class TestCSPUnsafeInlineRemoved:
 
 
 class TestAdminLoginRateLimit:
-    """POST /api/admin/session must be rate-limited to deter brute-force
-    attacks (F5)."""
+    """Admin login is rate-limited where it is handled: the Next.js route
+    handler (F5). ``POST /api/admin/session`` never reaches FastAPI —
+    nginx and Cloud Run send it to Next.js (see ``TestNginxAdminRouting``);
+    the route's behaviour is tested in
+    ``frontend/src/app/api/admin/session/__tests__/route.test.ts``."""
 
-    def test_auth_category_in_classify_path(self):
-        """_classify_path must return 'auth' for admin session POST."""
-        from sec_semantic_search.api.rate_limit import _classify_path
+    def test_route_handler_applies_login_limiter(self):
+        route = (
+            Path(__file__).parents[3] / "frontend/src/app/api/admin/session/route.ts"
+        ).read_text()
+        assert "checkAdminLoginRate(" in route
+        assert "recordFailedAdminLogin(" in route
+        assert "status: 429" in route
+        # Keyed on the proxy-appended address, not a client-chosen one.
+        assert "adminLoginClientKey(request.headers)" in route
 
-        assert _classify_path("/api/admin/session", "POST") == "auth"
+    def test_fastapi_limiter_has_no_admin_session_bucket(self):
+        """The old FastAPI ``auth`` bucket matched a path it never served."""
+        from sec_semantic_search.api.rate_limit import RateLimitMiddleware, _classify_path
 
-    def test_auth_category_does_not_match_get(self):
-        """GET /api/admin/session should not be classified as auth."""
-        from sec_semantic_search.api.rate_limit import _classify_path
-
-        result = _classify_path("/api/admin/session", "GET")
-        assert result != "auth"
-
-    def test_auth_bucket_has_strict_limit(self):
-        """The auth rate-limit bucket must have a strict limit (<=10/min)."""
-        from sec_semantic_search.api.rate_limit import RateLimitMiddleware
-
+        assert _classify_path("/api/admin/session", "POST") == "general"
         middleware = app.middleware_stack
         while middleware is not None:
             if isinstance(middleware, RateLimitMiddleware):
-                auth_bucket = middleware._buckets.get("auth")
-                assert auth_bucket is not None, "No 'auth' bucket in rate limiter"
-                assert auth_bucket.limit <= 10, (
-                    f"Auth rate limit too permissive: {auth_bucket.limit}/min"
-                )
+                assert "auth" not in middleware._buckets
                 break
             middleware = getattr(middleware, "app", None)
 
-    def test_auth_sliding_window_blocks_after_limit(self):
-        """Auth sliding window should block after 5 attempts."""
+    def test_sliding_window_blocks_after_limit(self):
+        """A 5-per-minute sliding window blocks the sixth request."""
         from sec_semantic_search.api.rate_limit import _SlidingWindow
 
         window = _SlidingWindow(requests_per_minute=5)

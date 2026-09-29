@@ -123,7 +123,9 @@ class TestEncryptedDBRoundTrip:
         registry.register_filing(filing_id, chunk_count=42)
 
         # Duplicate check (takes accession number string)
-        assert registry.is_duplicate(filing_id.accession_number) is True
+        assert registry.get_existing_accessions([filing_id.accession_number]) == {
+            filing_id.accession_number
+        }
 
         # List
         filings = registry.list_filings(ticker="AAPL")
@@ -203,7 +205,9 @@ class TestEncryptedDBRoundTrip:
             accession_number="0000789019-24-000001",
         )
         registry.register_filing(filing_id, chunk_count=10)
-        assert registry.is_duplicate("0000789019-24-000001") is True
+        assert registry.get_existing_accessions(["0000789019-24-000001"]) == {
+            "0000789019-24-000001"
+        }
         record = registry.get_filing("0000789019-24-000001")
         assert record is not None
         assert record.ticker == "MSFT"

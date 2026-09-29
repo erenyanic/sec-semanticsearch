@@ -108,9 +108,6 @@ def _classify_path(path: str, method: str) -> str | None:
     Returns ``None`` for paths that should not be rate-limited (e.g.
     health check, docs).
     """
-    # Auth endpoints get a strict limit to deter brute-force (F5).
-    if path.startswith("/api/admin/session") and method == "POST":
-        return "auth"
     if path.startswith("/api/search"):
         return "search"
     if path.startswith("/api/ingest") and method == "POST":
@@ -147,7 +144,6 @@ class RateLimitMiddleware:
         ingest_rpm: int = 5,
         delete_rpm: int = 10,
         general_rpm: int = 60,
-        auth_rpm: int = 5,
     ) -> None:
         self.app = app
         self._buckets: dict[str, _SlidingWindow] = {}
@@ -156,7 +152,6 @@ class RateLimitMiddleware:
             ("ingest", ingest_rpm),
             ("delete", delete_rpm),
             ("general", general_rpm),
-            ("auth", auth_rpm),
         ]:
             if rpm > 0:
                 self._buckets[category] = _SlidingWindow(rpm)

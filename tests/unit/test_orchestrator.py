@@ -56,19 +56,9 @@ def mock_embedder(sample_chunks):
 
 
 @pytest.fixture
-def mock_fetcher(sample_filing_id):
-    """A mock fetcher that returns fake HTML content."""
-    fetcher = MagicMock()
-    fetcher.fetch_latest.return_value = (sample_filing_id, "<html>fake</html>")
-    fetcher.fetch_one.return_value = (sample_filing_id, "<html>fake</html>")
-    return fetcher
-
-
-@pytest.fixture
-def orchestrator(mock_fetcher, mock_parser, mock_chunker, mock_embedder):
+def orchestrator(mock_parser, mock_chunker, mock_embedder):
     """An orchestrator with all components mocked."""
     return PipelineOrchestrator(
-        fetcher=mock_fetcher,
         parser=mock_parser,
         chunker=mock_chunker,
         embedder=mock_embedder,
@@ -154,20 +144,3 @@ class TestProgressCallback:
         """Should work without a callback (default None)."""
         result = orchestrator.process_filing(sample_filing_id, "<html>test</html>")
         assert result is not None
-
-
-# -----------------------------------------------------------------------
-# ingest_latest
-# -----------------------------------------------------------------------
-
-
-class TestIngestLatest:
-    """ingest_latest() fetches then processes."""
-
-    def test_calls_fetch_latest(self, orchestrator, mock_fetcher):
-        orchestrator.ingest_latest("AAPL", "10-K")
-        mock_fetcher.fetch_latest.assert_called_once_with("AAPL", "10-K")
-
-    def test_returns_processed_filing(self, orchestrator):
-        result = orchestrator.ingest_latest("AAPL", "10-K")
-        assert isinstance(result, ProcessedFiling)

@@ -14,7 +14,6 @@ import pytest
 
 from sec_semantic_search.core.exceptions import (
     ChunkingError,
-    ConfigurationError,
     DatabaseError,
     EmbeddingError,
     FetchError,
@@ -58,7 +57,6 @@ class TestSubclassInheritance:
     @pytest.mark.parametrize(
         "exc_class",
         [
-            ConfigurationError,
             FetchError,
             ParseError,
             ChunkingError,
@@ -77,7 +75,7 @@ class TestSubclassInheritance:
 
     @pytest.mark.parametrize(
         "exc_class",
-        [ConfigurationError, FetchError, ParseError, ChunkingError, EmbeddingError, SearchError],
+        [FetchError, ParseError, ChunkingError, EmbeddingError, SearchError],
     )
     def test_subclass_preserves_message_and_details(self, exc_class):
         """Subclasses should inherit the message+details formatting."""

@@ -18,7 +18,6 @@ import {
   FileText,
   Sun,
   Moon,
-  Loader2,
   LogOut,
   Shield,
   ShieldCheck,
@@ -46,11 +45,7 @@ const PILL_BUTTON =
   "hover:border-accent/40 hover:bg-card hover:text-fg " +
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent";
 
-interface NavbarProps {
-  isTaskActive?: boolean;
-}
-
-export function Navbar({ isTaskActive = false }: NavbarProps) {
+export function Navbar() {
   const pathname = usePathname();
   const { theme, toggleTheme } = useTheme();
   const { isAuthenticated, logout } = useEdgarSession();
@@ -131,13 +126,6 @@ export function Navbar({ isTaskActive = false }: NavbarProps) {
 
         {/* ---- Right: status + controls ---- */}
         <div className="ml-auto flex items-center gap-2">
-          {isTaskActive && (
-            <div className="flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-sm font-medium text-accent">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              <span className="hidden sm:inline">Ingesting</span>
-            </div>
-          )}
-
           {adminRequired && !isAdmin && (
             <button
               onClick={() => setShowAdminModal(true)}

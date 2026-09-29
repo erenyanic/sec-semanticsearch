@@ -19,7 +19,6 @@ Usage:
 
 from sec_semantic_search.core.exceptions import (
     ChunkingError,
-    ConfigurationError,
     DatabaseError,
     EmbeddingBusyError,
     EmbeddingError,
@@ -55,7 +54,6 @@ __all__ = [
     "IngestResult",
     # Exceptions
     "SECSemanticSearchError",
-    "ConfigurationError",
     "FetchError",
     "ParseError",
     "ChunkingError",

@@ -115,13 +115,15 @@ class TestMetadataRegistry:
 
         assert registry.list_filings(ticker="MSFT") == []
 
-    def test_is_duplicate(self, tmp_db_path, sample_filing_id):
-        """is_duplicate() should detect already-registered filings."""
+    def test_existing_accessions(self, tmp_db_path, sample_filing_id):
+        """get_existing_accessions() should detect already-registered filings."""
         registry = MetadataRegistry(db_path=tmp_db_path)
-        assert registry.is_duplicate(sample_filing_id.accession_number) is False
+        assert registry.get_existing_accessions([sample_filing_id.accession_number]) == set()
 
         registry.register_filing(sample_filing_id, chunk_count=5)
-        assert registry.is_duplicate(sample_filing_id.accession_number) is True
+        assert registry.get_existing_accessions([sample_filing_id.accession_number]) == {
+            sample_filing_id.accession_number
+        }
 
     def test_remove_filing(self, tmp_db_path, sample_filing_id):
         """remove_filing() should delete and return True; second call returns False."""

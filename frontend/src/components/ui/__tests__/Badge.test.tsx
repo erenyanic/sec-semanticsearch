@@ -1,5 +1,5 @@
 import { render, screen } from "@testing-library/react";
-import { Badge, taskStateToBadgeVariant } from "../Badge";
+import { Badge } from "../Badge";
 
 describe("Badge", () => {
   it("renders children", () => {
@@ -30,17 +30,5 @@ describe("Badge", () => {
   it("renders as a span", () => {
     render(<Badge>Tag</Badge>);
     expect(screen.getByText("Tag").tagName).toBe("SPAN");
-  });
-});
-
-describe("taskStateToBadgeVariant", () => {
-  it.each([
-    ["pending", "amber"],
-    ["running", "blue"],
-    ["completed", "green"],
-    ["failed", "red"],
-    ["cancelled", "red"],
-  ] as const)("maps %s → %s", (state, expected) => {
-    expect(taskStateToBadgeVariant(state)).toBe(expected);
   });
 });

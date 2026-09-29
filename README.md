@@ -225,13 +225,13 @@ The package is also available programmatically.
 ### End-to-end: ingest and search
 
 ```python
-from sec_semantic_search.pipeline import PipelineOrchestrator
+from sec_semantic_search.pipeline import FilingFetcher, PipelineOrchestrator
 from sec_semantic_search.database import ChromaDBClient, MetadataRegistry
 from sec_semantic_search.search import SearchEngine
 
-# 1. Process a filing (fetch → parse → chunk → embed)
-orchestrator = PipelineOrchestrator()
-result = orchestrator.ingest_latest("AAPL", "10-K")
+# 1. Fetch a filing, then process it (parse → chunk → embed)
+filing_id, html = FilingFetcher().fetch_latest("AAPL", "10-K")
+result = PipelineOrchestrator().process_filing(filing_id, html)
 
 print(f"Segments: {result.ingest_result.segment_count}")
 print(f"Chunks:   {result.ingest_result.chunk_count}")
@@ -242,7 +242,11 @@ chroma = ChromaDBClient()
 chroma.store_filing(result)
 
 registry = MetadataRegistry()
-registry.register_filing(result.filing_id, result.ingest_result.chunk_count)
+registry.register_filing(
+    result.filing_id,
+    result.ingest_result.chunk_count,
+    segments=result.segments,  # parent context shown with each search result
+)
 
 # 3. Search across all stored filings
 engine = SearchEngine()

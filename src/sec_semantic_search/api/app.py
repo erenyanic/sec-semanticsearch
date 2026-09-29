@@ -298,7 +298,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     embedder = EmbeddingGenerator()
     search_engine = SearchEngine(embedder=embedder, chroma_client=chroma, registry=registry)
     fetcher = FilingFetcher()
-    orchestrator = PipelineOrchestrator(fetcher=fetcher, embedder=embedder)
+    orchestrator = PipelineOrchestrator(embedder=embedder)
     task_manager = TaskManager(
         registry=registry,
         chroma=chroma,

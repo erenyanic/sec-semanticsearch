@@ -326,7 +326,7 @@ async def list_tasks(
 ) -> TaskListResponse:
     """
     Return all ingestion tasks, including active, completed, failed,
-    and cancelled tasks that have not yet been pruned (1-hour TTL).
+    and cancelled tasks that have not yet been pruned (24-hour TTL).
     """
     tasks = manager.list_tasks()
     statuses = [_task_info_to_status(t) for t in tasks]
@@ -358,7 +358,7 @@ def get_task(
                 "error": "not_found",
                 "message": f"Task '{task_id}' not found.",
                 "details": None,
-                "hint": "The task may have been pruned after completion (1-hour TTL).",
+                "hint": "The task may have been pruned after completion (24-hour TTL).",
             },
         )
 
@@ -393,7 +393,7 @@ def cancel_task(
                 "error": "not_found",
                 "message": f"Task '{task_id}' not found.",
                 "details": None,
-                "hint": "The task may have been pruned after completion (1-hour TTL).",
+                "hint": "The task may have been pruned after completion (24-hour TTL).",
             },
         )
 

@@ -37,6 +37,7 @@ from sec_semantic_search.core.types import (
 from sec_semantic_search.database.metadata import MetadataRegistry
 from sec_semantic_search.pipeline.chunk import TextChunker
 from sec_semantic_search.search.engine import SearchEngine
+from tests.helpers import count_segments
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -135,7 +136,7 @@ class TestRegistrySegmentsTable:
             chunk_count=5,
             segments=long_segments,
         )
-        assert registry.count_segments(filing_id.accession_number) == len(long_segments)
+        assert count_segments(registry, filing_id.accession_number) == len(long_segments)
 
     def test_register_filing_if_new_persists_segments(self, tmp_db_path, filing_id, long_segments):
         registry = MetadataRegistry(db_path=tmp_db_path)
@@ -145,7 +146,7 @@ class TestRegistrySegmentsTable:
             segments=long_segments,
         )
         assert inserted is True
-        assert registry.count_segments(filing_id.accession_number) == len(long_segments)
+        assert count_segments(registry, filing_id.accession_number) == len(long_segments)
 
     def test_register_filing_if_new_duplicate_does_not_double_insert(
         self, tmp_db_path, filing_id, long_segments
@@ -155,7 +156,7 @@ class TestRegistrySegmentsTable:
         inserted = registry.register_filing_if_new(filing_id, chunk_count=5, segments=long_segments)
         assert inserted is False
         # Count should still match the first insert — no duplication.
-        assert registry.count_segments(filing_id.accession_number) == len(long_segments)
+        assert count_segments(registry, filing_id.accession_number) == len(long_segments)
 
     def test_get_parent_segments_returns_text_by_pair(self, tmp_db_path, filing_id, long_segments):
         registry = MetadataRegistry(db_path=tmp_db_path)
@@ -184,25 +185,25 @@ class TestRegistrySegmentsTable:
     def test_remove_filing_cascades_segments(self, tmp_db_path, filing_id, long_segments):
         registry = MetadataRegistry(db_path=tmp_db_path)
         registry.register_filing(filing_id, chunk_count=5, segments=long_segments)
-        assert registry.count_segments(filing_id.accession_number) == len(long_segments)
+        assert count_segments(registry, filing_id.accession_number) == len(long_segments)
 
         registry.remove_filing(filing_id.accession_number)
-        assert registry.count_segments(filing_id.accession_number) == 0
+        assert count_segments(registry, filing_id.accession_number) == 0
 
     def test_remove_filings_batch_cascades_segments(self, tmp_db_path, filing_id, long_segments):
         registry = MetadataRegistry(db_path=tmp_db_path)
         registry.register_filing(filing_id, chunk_count=5, segments=long_segments)
 
         registry.remove_filings_batch([filing_id.accession_number])
-        assert registry.count_segments(filing_id.accession_number) == 0
+        assert count_segments(registry, filing_id.accession_number) == 0
 
     def test_clear_all_cascades_segments(self, tmp_db_path, filing_id, long_segments):
         registry = MetadataRegistry(db_path=tmp_db_path)
         registry.register_filing(filing_id, chunk_count=5, segments=long_segments)
-        assert registry.count_segments() == len(long_segments)
+        assert count_segments(registry) == len(long_segments)
 
         registry.clear_all()
-        assert registry.count_segments() == 0
+        assert count_segments(registry) == 0
 
 
 # ---------------------------------------------------------------------------

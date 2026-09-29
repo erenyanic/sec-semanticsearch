@@ -6,7 +6,6 @@ all project-specific errors with a single except clause when desired.
 
 Exception hierarchy:
     SECSemanticSearchError (base)
-    ├── ConfigurationError — Invalid or missing configuration
     ├── FetchError — SEC EDGAR API or network failures
     ├── ParseError — HTML parsing failures (doc2dict)
     ├── ChunkingError — Text chunking failures
@@ -36,19 +35,6 @@ class SECSemanticSearchError(Exception):
         if self.details:
             return f"{self.message} — {self.details}"
         return self.message
-
-
-class ConfigurationError(SECSemanticSearchError):
-    """
-    Raised when configuration is invalid or missing.
-
-    Examples:
-        - Missing required environment variables (EDGAR_IDENTITY_NAME)
-        - Invalid configuration values (negative token limits)
-        - Missing .env file when required
-    """
-
-    pass
 
 
 class FetchError(SECSemanticSearchError):

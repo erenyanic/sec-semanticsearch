@@ -8,7 +8,21 @@ be importable via standard Python imports.
 """
 
 from sec_semantic_search.api.tasks import TaskInfo, TaskState
-from sec_semantic_search.database.metadata import FilingRecord
+from sec_semantic_search.database.metadata import FilingRecord, MetadataRegistry
+
+
+def count_segments(registry: MetadataRegistry, accession_number: str | None = None) -> int:
+    """Count rows in the registry's ``segments`` table, optionally for one filing.
+
+    Test-only: production reads segments through ``get_parent_segments()``.
+    """
+    sql = "SELECT COUNT(*) FROM segments"
+    params: tuple = ()
+    if accession_number is not None:
+        sql += " WHERE accession_number = ?"
+        params = (accession_number,)
+    with registry._read_lock:
+        return registry._read_conn.execute(sql, params).fetchone()[0]
 
 
 def make_filing_record(

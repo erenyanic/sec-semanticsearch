@@ -49,22 +49,10 @@ def parse_form_types(form_input: str) -> tuple[str, ...]:
     return tuple(sorted(set(raw)))
 
 
-# Embedding model parameters
+# Embedding model parameters. The model name and the chunking, storage and
+# search defaults live on the settings classes (config/settings.py), the
+# single source of truth.
 EMBEDDING_DIMENSION = 768  # Dimension of google/embeddinggemma-300m
-EMBEDDING_MODEL_NAME = "google/embeddinggemma-300m"
-
-# Chunking parameters
-DEFAULT_CHUNK_TOKEN_LIMIT = 500
-DEFAULT_CHUNK_TOLERANCE = 50
-
-# Database
-DEFAULT_CHROMADB_PATH = "./data/chroma_db"
-DEFAULT_METADATA_DB_PATH = "./data/metadata.sqlite"
-DEFAULT_MAX_FILINGS = 500
 
 # Collection naming
 COLLECTION_NAME = "sec_filings"
-
-# Search defaults
-DEFAULT_SEARCH_TOP_K = 5
-DEFAULT_MIN_SIMILARITY = 0.0
