@@ -4,6 +4,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 
 import {
+  adminLoginClientKey,
   checkAdminLoginRate,
   recordFailedAdminLogin,
   resetAdminLoginRateLimit,
@@ -76,5 +77,38 @@ describe("Admin login rate limiter", () => {
 
     resetAdminLoginRateLimit();
     expect(checkAdminLoginRate(ip).allowed).toBe(true);
+  });
+});
+
+describe("adminLoginClientKey", () => {
+  const key = (xff?: string) =>
+    adminLoginClientKey(new Headers(xff === undefined ? {} : { "x-forwarded-for": xff }));
+
+  it("uses the entry appended by the nearest proxy (right-most)", () => {
+    // nginx / Cloud Run append the real address after the client's value.
+    expect(key("6.6.6.6, 203.0.113.9")).toBe("203.0.113.9");
+    expect(key("1.1.1.1, 2.2.2.2 ,  203.0.113.9 ")).toBe("203.0.113.9");
+  });
+
+  it("uses a single entry as is", () => {
+    expect(key("203.0.113.9")).toBe("203.0.113.9");
+  });
+
+  it("falls back to a shared key without the header", () => {
+    expect(key()).toBe("unknown");
+    expect(key(" , ")).toBe("unknown");
+  });
+
+  it("ignores X-Real-IP, which a client can set on Cloud Run", () => {
+    const headers = new Headers({ "x-real-ip": "6.6.6.6", "x-forwarded-for": "203.0.113.9" });
+    expect(adminLoginClientKey(headers)).toBe("203.0.113.9");
+  });
+
+  it("a rotating spoofed prefix cannot escape the limit", () => {
+    resetAdminLoginRateLimit();
+    for (let i = 0; i < 5; i++) {
+      recordFailedAdminLogin(key(`10.9.9.${i}, 203.0.113.9`));
+    }
+    expect(checkAdminLoginRate(key("10.9.9.99, 203.0.113.9")).allowed).toBe(false);
   });
 });

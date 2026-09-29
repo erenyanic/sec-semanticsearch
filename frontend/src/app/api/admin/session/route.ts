@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import {
   ADMIN_SESSION_COOKIE,
+  adminLoginClientKey,
   buildAdminSessionValue,
   checkAdminLoginRate,
   getConfiguredAdminKey,
@@ -26,10 +27,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   }
 
   // Brute-force protection: rate limit failed login attempts per IP (F5).
-  const clientIp =
-    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-    request.headers.get("x-real-ip") ??
-    "unknown";
+  const clientIp = adminLoginClientKey(request.headers);
 
   const rateCheck = checkAdminLoginRate(clientIp);
   if (!rateCheck.allowed) {

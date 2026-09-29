@@ -70,6 +70,24 @@ export function resetAdminLoginRateLimit(): void {
   _failedAttempts.clear();
 }
 
+/**
+ * Key for the admin login limiter: the right-most `X-Forwarded-For` entry.
+ *
+ * nginx (`$proxy_add_x_forwarded_for`) and Cloud Run's front end append
+ * the connecting address after whatever the client sent, so only the
+ * right-most entry is outside the client's control; Next.js fills the
+ * header with the socket address when no proxy set it. The left-most
+ * entry, used before, let a client choose a fresh key for every attempt.
+ * `X-Real-IP` is not used: nothing overwrites it on Cloud Run.
+ */
+export function adminLoginClientKey(headers: Headers): string {
+  const entries = (headers.get("x-forwarded-for") ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return entries.at(-1) ?? "unknown";
+}
+
 const ADMIN_SESSION_SALT = "sec-search-admin-session-v1";
 
 export function getConfiguredAdminKey(): string | null {
