@@ -865,18 +865,25 @@ class TestApiKeyAuthentication:
                 api=MagicMock(key=self.TEST_KEY, cors_origins=["http://localhost:3000"]),
             ),
         )
+        # The key in the URL is ignored, so the server waits for an auth
+        # message that never comes. Only the outcome of the timeout is under
+        # test, not its production length (5 s).
+        monkeypatch.setattr("sec_semantic_search.api.websocket._AUTH_TIMEOUT_SECONDS", 0.05)
         info = make_task_info(state=TaskState.COMPLETED)
         manager = MagicMock()
         manager.get_task.return_value = info
         app.state.task_manager = manager
 
         client = TestClient(app)
-        with pytest.raises(WebSocketDisconnect):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
             with client.websocket_connect(
                 f"/ws/ingest/{info.task_id}?api_key={self.TEST_KEY}",
                 headers=_WS_HEADERS,
             ) as ws:
                 ws.receive_json()
+
+        assert exc_info.value.code == 4001
+        manager.get_task.assert_not_called()
 
     def test_websocket_accepts_no_key_when_auth_disabled(self):
         """WebSocket should work without key when auth is disabled."""
