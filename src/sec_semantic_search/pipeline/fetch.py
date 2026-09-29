@@ -33,9 +33,10 @@ Usage:
         process(filing_id, html)
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from itertools import islice
 from typing import Any
 
 from edgar import Company, set_identity
@@ -203,6 +204,23 @@ class FilingFetcher:
             actual_form = getattr(filing, "form", "")
             return isinstance(actual_form, str) and actual_form.endswith("/A")
         return False
+
+    def _eligible(self, filings: Iterable[Any], requested_form: str) -> Iterator[Any]:
+        """Yield the filings that ``_should_skip`` keeps, lazily.
+
+        edgartools builds a ``Filing`` object per row as it is iterated;
+        callers slice this generator so a company with thousands of 8-Ks
+        does not build them all to keep a handful.
+        """
+        for filing in filings:
+            if self._should_skip(filing, requested_form):
+                logger.debug(
+                    "Skipping amendment %s (%s) — original filing preferred",
+                    filing.accession_no,
+                    getattr(filing, "form", "unknown"),
+                )
+                continue
+            yield filing
 
     def _validate_form_type(self, form_type: str) -> str:
         """
@@ -530,27 +548,17 @@ class FilingFetcher:
         # avoiding materialising the entire filing list from EDGAR.
         # When a base form is requested, amendments are filtered out so
         # they do not displace the original via the UNIQUE constraint.
-        result = []
-        for filing in filings:
-            if len(result) >= count:
-                break
-            if self._should_skip(filing, form_type):
-                logger.debug(
-                    "Skipping amendment %s (%s) — original filing preferred",
-                    filing.accession_no,
-                    getattr(filing, "form", "unknown"),
-                )
-                continue
-            result.append(
-                FilingInfo(
-                    ticker=ticker,
-                    form_type=form_type,
-                    filing_date=self._parse_filing_date(filing.filing_date),
-                    accession_number=filing.accession_no,
-                    company_name=getattr(filing, "company", ticker),
-                    _filing_obj=filing,
-                )
+        result = [
+            FilingInfo(
+                ticker=ticker,
+                form_type=form_type,
+                filing_date=self._parse_filing_date(filing.filing_date),
+                accession_number=filing.accession_no,
+                company_name=getattr(filing, "company", ticker),
+                _filing_obj=filing,
             )
+            for filing in islice(self._eligible(filings, form_type), count)
+        ]
 
         logger.info(
             "Listed %d available %s filings for %s",
@@ -684,16 +692,21 @@ class FilingFetcher:
             company, form_type, year=year, start_date=start_date, end_date=end_date
         )
 
-        # When a base form is requested, filter out amendments before indexing.
-        filings_list = [f for f in filings if not self._should_skip(f, form_type)]
+        # When a base form is requested, filter out amendments before
+        # indexing. Stop at the requested position rather than building a
+        # ``Filing`` for every row the company ever filed.
+        filing = None
+        available = 0
+        for available, candidate in enumerate(self._eligible(filings, form_type), start=1):
+            if available > index:
+                filing = candidate
+                break
 
-        if index >= len(filings_list):
+        if filing is None:
             raise FetchError(
                 f"Index {index} out of range",
-                details=f"Only {len(filings_list)} filings available.",
+                details=f"Only {available} filings available.",
             )
-
-        filing = filings_list[index]
         filing_id, html_content = self._fetch_filing_content(filing, ticker, form_type)
 
         logger.info(
@@ -772,15 +785,15 @@ class FilingFetcher:
         )
 
         # When a base form is requested, filter out amendments; then limit.
-        all_filings = [f for f in filings if not self._should_skip(f, form_type)]
-        filings_list = all_filings[:count]
-        total_available = len(all_filings)
+        # Slice lazily: one row past ``count`` is enough to know more exist.
+        eligible = self._eligible(filings, form_type)
+        filings_list = list(islice(eligible, count))
 
-        if total_available > count:
+        if next(eligible, None) is not None:
             logger.info(
-                "Limiting to %d of %d available filings",
+                "Limiting to %d %s filings; more are available",
                 count,
-                total_available,
+                form_type,
             )
 
         fetched_count = 0

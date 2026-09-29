@@ -408,6 +408,66 @@ class TestDeleteFilingsBatch:
 
 
 # -----------------------------------------------------------------------
+# ingest add -t (cross-form)
+# -----------------------------------------------------------------------
+
+
+class TestIngestAcrossFormsFetch:
+    """``ingest add -t`` fetches from the listing's cached Filing objects."""
+
+    def test_fetches_via_cached_filing_objects(self):
+        from datetime import date
+
+        from sec_semantic_search.core.types import FilingIdentifier
+        from sec_semantic_search.pipeline.fetch import FilingInfo
+
+        infos = [
+            FilingInfo(
+                ticker="AAPL",
+                form_type=form,
+                filing_date=date(2024, month, 1),
+                accession_number=f"0000320193-24-00000{month}",
+                company_name="Apple Inc.",
+                _filing_obj=MagicMock(),
+            )
+            for month, form in ((3, "10-Q"), (2, "10-K"))
+        ]
+
+        def fetched(info):
+            return (
+                FilingIdentifier(
+                    ticker=info.ticker,
+                    form_type=info.form_type,
+                    filing_date=info.filing_date,
+                    accession_number=info.accession_number,
+                ),
+                "<html></html>",
+            )
+
+        with (
+            patch("sec_semantic_search.cli.ingest.MetadataRegistry") as registry_cls,
+            patch("sec_semantic_search.cli.ingest.ChromaDBClient"),
+            patch("sec_semantic_search.cli.ingest.FilingFetcher") as fetcher_cls,
+            patch("sec_semantic_search.cli.ingest.PipelineOrchestrator") as orchestrator_cls,
+        ):
+            registry_cls.return_value.get_existing_accessions.return_value = set()
+            fetcher = fetcher_cls.return_value
+            fetcher.list_available_across_forms.return_value = infos
+            fetcher.fetch_filing_content.side_effect = fetched
+            processed = MagicMock()
+            processed.ingest_result.chunk_count = 3
+            processed.ingest_result.duration_seconds = 0.1
+            orchestrator_cls.return_value.process_filing.return_value = processed
+
+            result = runner.invoke(app, ["ingest", "add", "AAPL", "-t", "2"])
+
+        assert result.exit_code == 0, result.output
+        assert [c.args[0] for c in fetcher.fetch_filing_content.call_args_list] == infos
+        fetcher.fetch_by_accession.assert_not_called()
+        assert "2 ingested" in result.output
+
+
+# -----------------------------------------------------------------------
 # search
 # -----------------------------------------------------------------------
 

@@ -262,7 +262,7 @@ class TestFetchLimitingLog:
             pkg_logger.propagate = False
 
         assert len(results) == 2
-        assert "Limiting to 2 of 5 available filings" in caplog.text
+        assert "Limiting to 2 10-K filings; more are available" in caplog.text
 
     def test_no_limiting_log_when_count_equals_available(self, fetcher, caplog):
         """When count equals available filings, no limiting log should appear."""
@@ -288,6 +288,90 @@ class TestFetchLimitingLog:
 
         assert len(results) == 3
         assert "Limiting to" not in caplog.text
+
+
+class _CountingFilings:
+    """Iterable standing in for edgartools ``Filings``: counts rows pulled.
+
+    edgartools builds a ``Filing`` object per row on iteration, so rows
+    pulled is the cost the lazy filter avoids.
+    """
+
+    def __init__(self, n: int, *, amendment_every: int = 0):
+        self.n = n
+        self.amendment_every = amendment_every
+        self.pulled = 0
+
+    def __len__(self):  # cheap in edgartools: a table row count
+        return self.n
+
+    def __bool__(self):
+        return self.n > 0
+
+    def __iter__(self):
+        for i in range(self.n):
+            self.pulled += 1
+            form = "10-K/A" if self.amendment_every and i % self.amendment_every == 1 else "10-K"
+            yield _make_mock_filing(
+                f"ACC-{i:05d}", date(2024, 1, 1), html_content=f"<html>{i}</html>", form=form
+            )
+
+
+class TestLazyFilingIteration:
+    """Only the rows a call needs are pulled from edgartools."""
+
+    @staticmethod
+    def _company(filings):
+        company = MagicMock()
+        company.get_filings.return_value = filings
+        return company
+
+    def test_fetch_pulls_count_plus_one(self, fetcher):
+        filings = _CountingFilings(3000)
+        with patch.object(fetcher, "_get_company", return_value=self._company(filings)):
+            results = list(fetcher.fetch("AAPL", "10-K", count=2))
+        assert [fid.accession_number for fid, _ in results] == ["ACC-00000", "ACC-00001"]
+        assert filings.pulled == 3  # two kept, one to learn that more exist
+
+    def test_fetch_skips_amendments_lazily(self, fetcher):
+        filings = _CountingFilings(3000, amendment_every=2)
+        with patch.object(fetcher, "_get_company", return_value=self._company(filings)):
+            results = list(fetcher.fetch("AAPL", "10-K", count=3))
+        assert [fid.accession_number for fid, _ in results] == [
+            "ACC-00000",
+            "ACC-00002",
+            "ACC-00004",
+        ]
+        assert filings.pulled <= 7
+
+    def test_fetch_one_latest_pulls_one_row(self, fetcher):
+        filings = _CountingFilings(3000)
+        with patch.object(fetcher, "_get_company", return_value=self._company(filings)):
+            filing_id, _ = fetcher.fetch_latest("AAPL", "10-K")
+        assert filing_id.accession_number == "ACC-00000"
+        assert filings.pulled == 1
+
+    def test_fetch_one_index_counts_only_originals(self, fetcher):
+        filings = _CountingFilings(3000, amendment_every=2)
+        with patch.object(fetcher, "_get_company", return_value=self._company(filings)):
+            filing_id, _ = fetcher.fetch_one("AAPL", "10-K", index=2)
+        assert filing_id.accession_number == "ACC-00004"
+        assert filings.pulled == 5
+
+    def test_fetch_one_out_of_range_reports_available(self, fetcher):
+        filings = _CountingFilings(2)
+        with patch.object(fetcher, "_get_company", return_value=self._company(filings)):
+            with pytest.raises(FetchError, match="Index 5 out of range") as exc_info:
+                fetcher.fetch_one("AAPL", "10-K", index=5)
+        assert exc_info.value.details == "Only 2 filings available."
+
+    def test_list_available_pulls_count_rows(self, fetcher):
+        filings = _CountingFilings(3000)
+        with patch.object(fetcher, "_get_company", return_value=self._company(filings)):
+            available = fetcher.list_available("AAPL", "10-K", count=4)
+        assert len(available) == 4
+        assert filings.pulled == 4
+        assert all(info._filing_obj is not None for info in available)
 
 
 class TestFetchCountNone:

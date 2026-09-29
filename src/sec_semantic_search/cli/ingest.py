@@ -428,13 +428,10 @@ def _ingest_across_forms(
                 progress.advance(filing_task)
                 continue
 
-            # Fetch HTML content for this specific filing.
+            # Fetch HTML from the Filing object the listing already built,
+            # rather than re-listing the company's filings per filing.
             try:
-                filing_id, html_content = fetcher.fetch_by_accession(
-                    fi.ticker,
-                    fi.form_type,
-                    fi.accession_number,
-                )
+                filing_id, html_content = fetcher.fetch_filing_content(fi)
             except FetchError as e:
                 progress.console.print(f"  [red]Fetch failed{filing_num}:[/red] {e.message}")
                 failed += 1
