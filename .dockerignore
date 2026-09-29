@@ -66,3 +66,6 @@ frontend/vitest.config.ts
 
 # Lock files and tooling
 uv.lock
+
+# Screenshots and images for the README only
+assets/

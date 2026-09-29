@@ -30,11 +30,13 @@ FROM python:3.12.13-slim AS builder
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 # Install build dependencies:
-#   - gcc/g++ + python3-dev: compile C extensions
+#   - gcc/g++: compile C extensions (the base image already ships the
+#     interpreter's own headers; Debian's python3-dev would add another
+#     Python's)
 #   - libsqlcipher-dev: SQLCipher headers for pysqlcipher3
 #   - pkg-config: locate sqlcipher during build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc g++ python3-dev \
+        gcc g++ \
         libsqlcipher-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -45,22 +47,29 @@ WORKDIR /build
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install PyTorch first (largest dependency, cached separately)
+# Layers run from least to most often changed, so a source edit reuses
+# every dependency layer.
+#
+# 1. PyTorch, from its own index only. --index-url (not --extra-index-url)
+#    means nothing else can be resolved from that index, so no package on
+#    it can shadow a PyPI one (dependency confusion).
+RUN pip install --no-cache-dir --index-url "$TORCH_INDEX_URL" "torch>=2.10.0"
+
+# 2. Every other runtime dependency plus the encryption extra, from PyPI,
+#    read from pyproject.toml. Rebuilt only when pyproject.toml changes.
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir --extra-index-url "$TORCH_INDEX_URL" \
-        torch>=2.10.0
+RUN python -c "import tomllib; p = tomllib.load(open('pyproject.toml', 'rb'))['project']; \
+print('\n'.join([d for d in p['dependencies'] if not d.startswith('torch')] \
++ p['optional-dependencies']['encryption']))" > /tmp/requirements.txt \
+    && pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Install the project with all deps + encryption extra
-COPY src/ ./src/
-COPY README.md ./
-RUN pip install --no-cache-dir --extra-index-url "$TORCH_INDEX_URL" \
-        ".[encryption]"
-
-# Bake the embedding model into the Hugging Face cache. Loading it once
-# through sentence-transformers fetches exactly the files the runtime
-# needs; the second load proves they are sufficient with the Hub offline.
-# The deploy pipeline sets REQUIRE_BAKED_MODEL=1 because the Cloud Run
-# manifest runs with HF_HUB_OFFLINE=1 and cannot download at runtime.
+# 3. The embedding model, baked into the Hugging Face cache. It does not
+#    depend on the project source, so a source edit does not download it
+#    again. Loading it once through sentence-transformers fetches exactly
+#    the files the runtime needs; the second load proves they are
+#    sufficient with the Hub offline. The deploy pipeline sets
+#    REQUIRE_BAKED_MODEL=1 because the Cloud Run manifest runs with
+#    HF_HUB_OFFLINE=1 and cannot download at runtime.
 ARG EMBEDDING_MODEL_NAME=google/embeddinggemma-300m
 ARG REQUIRE_BAKED_MODEL=0
 ENV HF_HOME=/opt/hf
@@ -80,6 +89,13 @@ RUN --mount=type=secret,id=hf_token \
         echo "No hf_token build secret; the model will download on first use."; \
     fi
 
+# 4. The project as a wheel, installed in the runtime stage's last layer.
+#    The dependency venv copied into the runtime stage then stays
+#    byte-identical across source edits, so a deploy does not push it again.
+COPY README.md ./
+COPY src/ ./src/
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels .
+
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────
 FROM python:3.12.13-slim AS runtime
@@ -91,7 +107,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsqlcipher1 gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the pre-built virtual environment from the builder
+# Copy the pre-built virtual environment (dependencies only) from the builder
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
@@ -124,6 +140,10 @@ ENV DB_CHROMA_PATH=/app/data/chroma_db \
 # the non-root 'app' user via gosu before exec-ing CMD.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# The project itself — last, so a source edit rebuilds only this layer.
+COPY --from=builder /wheels /tmp/wheels
+RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
 
 # Health check — uses the /api/health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

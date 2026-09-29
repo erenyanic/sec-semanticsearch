@@ -61,13 +61,18 @@ jobs:
       # CPU-only PyTorch wheel keeps the install small (~800 MB vs ~8 GB
       # for CUDA). GPU tests are mocked (see tests/unit/test_embed_gpu.py)
       # so this is sufficient for the full suite.
+      #
+      # torch comes from the PyTorch index only (--index-url), everything
+      # else from PyPI only: with --extra-index-url pip picks the highest
+      # version from either index, so a package published on one could
+      # shadow the other (dependency confusion). The installed CPU torch
+      # satisfies the project's torch requirement in the second step.
       - name: Install backend dependencies (CPU torch)
         run: |
           python -m pip install --upgrade pip
-          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+          pip install --index-url https://download.pytorch.org/whl/cpu \
               "torch>=2.10.0"
-          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
-              ".[dev]"
+          pip install ".[dev]"
 
       # The `encryption` extra (pysqlcipher3) is intentionally not
       # installed: SQLCipher tests mock the module via sys.modules,

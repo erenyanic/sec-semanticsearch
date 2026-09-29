@@ -160,6 +160,7 @@ jobs:
           {
             echo "api_image=${api_base}:latest"
             echo "api_image_sha=${api_base}:${short_sha}"
+            echo "api_build_cache=${api_base}-build-cache:latest"
             echo "frontend_image=${fe_base}:latest"
             echo "frontend_image_sha=${fe_base}:${short_sha}"
           } >> "$GITHUB_OUTPUT"
@@ -179,9 +180,19 @@ jobs:
       # never expanded into the command line, a build arg or a layer.
       # REQUIRE_BAKED_MODEL=1 fails the build if the secret is missing,
       # because the Cloud Run manifest runs with HF_HUB_OFFLINE=1.
+      #
+      # Layer cache: each Cloud Build worker starts empty, and an
+      # image's inline cache only describes its final stage — but the CUDA
+      # wheel, the dependencies and the model are all in the `builder`
+      # stage. So the builder target is built and pushed first as
+      # `api-build-cache`, and both builds read it back with --cache-from.
+      # A deploy that changes only `src/` rebuilds the project wheel and the
+      # runtime layer that installs it; the first deploy just warns that
+      # the cache images do not exist yet.
       - name: Build API image (CUDA) via Cloud Build
         env:
           API_IMAGE: ${{ steps.image-tags.outputs.api_image }}
+          API_BUILD_CACHE: ${{ steps.image-tags.outputs.api_build_cache }}
         run: |
           cat > /tmp/cloudbuild-api.yaml <<'EOF'
           steps:
@@ -194,7 +205,17 @@ jobs:
               args:
                 - -c
                 - >-
-                  docker build -f Dockerfile.api
+                  docker build -f Dockerfile.api --target builder
+                  --cache-from ${_BUILD_CACHE}
+                  --build-arg BUILDKIT_INLINE_CACHE=1
+                  --build-arg TORCH_INDEX_URL=${_TORCH_INDEX_URL}
+                  --build-arg REQUIRE_BAKED_MODEL=1
+                  --secret id=hf_token,env=HF_TOKEN
+                  -t ${_BUILD_CACHE} .
+                  && docker build -f Dockerfile.api
+                  --cache-from ${_BUILD_CACHE}
+                  --cache-from ${_IMAGE}
+                  --build-arg BUILDKIT_INLINE_CACHE=1
                   --build-arg TORCH_INDEX_URL=${_TORCH_INDEX_URL}
                   --build-arg REQUIRE_BAKED_MODEL=1
                   --secret id=hf_token,env=HF_TOKEN
@@ -205,6 +226,7 @@ jobs:
                 env: HF_TOKEN
           images:
             - ${_IMAGE}
+            - ${_BUILD_CACHE}
           options:
             machineType: E2_HIGHCPU_8
           timeout: 3600s
@@ -212,7 +234,7 @@ jobs:
           gcloud builds submit \
             --project="${PROJECT_ID}" \
             --config=/tmp/cloudbuild-api.yaml \
-            --substitutions=_IMAGE="${API_IMAGE}",_TORCH_INDEX_URL="${TORCH_INDEX_URL}" \
+            --substitutions=_IMAGE="${API_IMAGE}",_BUILD_CACHE="${API_BUILD_CACHE}",_TORCH_INDEX_URL="${TORCH_INDEX_URL}" \
             .
 
       - name: Tag API image with commit SHA
