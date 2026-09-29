@@ -181,30 +181,114 @@ class TestBoundedWait:
         assert generator.embed_query("q", lock_timeout=0.05).shape == (EMBEDDING_DIMENSION,)
 
 
-class TestIdleTimerGeneration:
-    def test_stale_timer_does_not_unload(self, generator):
-        """A timer that fired during an encode is superseded by the encode's re-arm."""
-        generator._idle_generation = 2
-        generator._on_idle_timeout(1)
-        assert generator.is_loaded
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
 
-    def test_current_timer_unloads(self, generator):
-        generator._idle_generation = 2
-        generator._on_idle_timeout(2)
-        assert not generator.is_loaded
 
-    def test_model_access_advances_generation(self, generator):
+class TestIdleTimer:
+    """One timer per idle period, not one per model access."""
+
+    def test_repeated_access_creates_one_timer(self, generator):
         generator._idle_timeout_seconds = 60.0
+        created: list[threading.Timer] = []
+        real_timer = threading.Timer
+
+        def counting_timer(*args, **kwargs):
+            timer = real_timer(*args, **kwargs)
+            created.append(timer)
+            return timer
+
         try:
-            before = generator._idle_generation
-            _ = generator.model
-            _ = generator.model
-            assert generator._idle_generation == before + 2
+            with patch("sec_semantic_search.pipeline.embed.threading.Timer", counting_timer):
+                for _ in range(50):
+                    _ = generator.model
+                    generator.embed_query("q")
+            assert len(created) == 1
+        finally:
+            generator._cancel_idle_timer()
+
+    def test_unloads_after_timeout_without_use(self, generator):
+        generator._idle_timeout_seconds = 0.1
+        _ = generator.model
+        assert _wait_until(lambda: not generator.is_loaded)
+        assert generator._idle_timer is None
+
+    def test_use_postpones_unload(self, generator):
+        generator._idle_timeout_seconds = 0.3
+        start = time.monotonic()
+        _ = generator.model
+        time.sleep(0.2)
+        generator.embed_query("q")  # last use at ~0.2 s: idle until ~0.5 s
+        assert _wait_until(lambda: not generator.is_loaded, timeout=3)
+        assert time.monotonic() - start >= 0.45
+
+    def test_idle_counts_from_end_of_a_long_encode(self, generator):
+        """A timer that fires during an encode must not unload right after it."""
+        generator._idle_timeout_seconds = 0.2
+
+        def slow(texts, **kwargs):
+            time.sleep(0.35)  # longer than the timeout
+            return _vectors(texts)
+
+        generator._model.encode_document.side_effect = slow
+        generator.embed_texts(["t"], show_progress=False)
+        ended = time.monotonic()
+        # The timer fired mid-encode, waited for the lock, then re-armed.
+        time.sleep(0.05)
+        assert generator.is_loaded
+        assert _wait_until(lambda: not generator.is_loaded, timeout=3)
+        assert time.monotonic() - ended >= 0.15
+
+    def test_stale_timer_does_not_unload(self, generator):
+        """A callback from a timer that is no longer armed is ignored."""
+        generator._idle_timeout_seconds = 60.0
+        _ = generator.model
+        armed = generator._idle_timer
+        try:
+            stale = threading.Thread(target=generator._on_idle_timeout)
+            stale.start()
+            stale.join(timeout=2)
+            assert generator.is_loaded
+            assert generator._idle_timer is armed
+        finally:
+            generator._cancel_idle_timer()
+
+    def test_timer_cancelled_by_unload_is_ignored_after_reload(self, generator):
+        generator._idle_timeout_seconds = 60.0
+        _ = generator.model
+        old = generator._idle_timer
+        model = generator._model
+        generator.unload()
+        assert generator._idle_timer is None
+        generator._model = model  # reload
+        generator._touch()
+        new = generator._idle_timer
+        try:
+            assert new is not None and new is not old
+            # The old timer's callback, had it already fired, must not act.
+            stale = threading.Thread(target=generator._on_idle_timeout)
+            stale.start()
+            stale.join(timeout=2)
+            assert generator.is_loaded
+            assert generator._idle_timer is new
         finally:
             generator._cancel_idle_timer()
 
     def test_no_timer_when_timeout_disabled(self, generator):
         generator._idle_timeout_seconds = 0
         _ = generator.model
+        generator.embed_query("q")
         assert generator._idle_timer is None
-        assert generator._idle_generation == 0
+
+    def test_failed_load_arms_no_timer(self):
+        gen = EmbeddingGenerator()
+        gen._idle_timeout_seconds = 60.0
+        with patch.object(EmbeddingGenerator, "_load_model", side_effect=EmbeddingError("x")):
+            with pytest.raises(EmbeddingError):
+                gen.embed_query("q")
+        assert gen._idle_timer is None

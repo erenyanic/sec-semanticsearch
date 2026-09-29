@@ -15,6 +15,7 @@ Usage:
 
 import os
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -83,10 +84,13 @@ class EmbeddingGenerator:
         # holds it while reading ``self.model``.
         self._lock = threading.RLock()
 
-        # Idle timeout — auto-unload model after inactivity.
+        # Idle timeout — auto-unload model after inactivity. A use only
+        # stamps ``_last_used``; one timer at a time checks the stamp when it
+        # fires and re-arms for the remainder, so a busy API does not create
+        # a timer thread per search.
         self._idle_timeout_seconds: float = settings.embedding.idle_timeout_minutes * 60.0
         self._idle_timer: threading.Timer | None = None
-        self._idle_generation = 0
+        self._last_used = 0.0
 
         logger.debug(
             "EmbeddingGenerator configured: model=%s, device=%s, batch_size=%d",
@@ -140,7 +144,7 @@ class EmbeddingGenerator:
         with self._lock:
             if self._model is None:
                 self._model = self._load_model()
-            self._schedule_idle_timer()
+            self._touch()
             return self._model
 
     def unload(self) -> None:
@@ -171,19 +175,24 @@ class EmbeddingGenerator:
     # Idle timer
     # ------------------------------------------------------------------
 
-    def _schedule_idle_timer(self) -> None:
-        """Reset the idle timer if a timeout is configured. Caller holds the lock."""
-        if self._idle_timeout_seconds <= 0:
+    def _touch(self) -> None:
+        """Record a use of the loaded model; start the idle timer if none runs.
+
+        Caller holds the lock. Cheap by design: it runs on every model
+        access, and a timer thread is created at most once per idle period.
+        """
+        if self._idle_timeout_seconds <= 0 or self._model is None:
             return
-        self._cancel_idle_timer()
-        self._idle_generation += 1
-        self._idle_timer = threading.Timer(
-            self._idle_timeout_seconds,
-            self._on_idle_timeout,
-            args=(self._idle_generation,),
-        )
-        self._idle_timer.daemon = True
-        self._idle_timer.start()
+        self._last_used = time.monotonic()
+        if self._idle_timer is None:
+            self._start_idle_timer(self._idle_timeout_seconds)
+
+    def _start_idle_timer(self, delay: float) -> None:
+        """Arm the idle timer to fire after ``delay`` seconds. Caller holds the lock."""
+        timer = threading.Timer(delay, self._on_idle_timeout)
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
 
     def _cancel_idle_timer(self) -> None:
         """Cancel any running idle timer."""
@@ -191,12 +200,21 @@ class EmbeddingGenerator:
             self._idle_timer.cancel()
             self._idle_timer = None
 
-    def _on_idle_timeout(self, generation: int) -> None:
-        """Called when the idle timer fires."""
+    def _on_idle_timeout(self) -> None:
+        """Called on the timer's thread when the idle timer fires."""
         with self._lock:
-            # A timer that fired while an encode held the lock is stale: that
-            # encode re-armed a newer timer, so the model is not idle.
-            if generation != self._idle_generation:
+            # Only the armed timer may act. One cancelled by ``unload()`` or
+            # replaced after a reload may still run once it gets the lock.
+            if self._idle_timer is not threading.current_thread():
+                return
+            self._idle_timer = None
+            if self._model is None:
+                return
+            # Used since the timer was armed (or an encode that held the
+            # lock past the deadline just ended): wait out the remainder.
+            remaining = self._idle_timeout_seconds - (time.monotonic() - self._last_used)
+            if remaining > 0:
+                self._start_idle_timer(remaining)
                 return
             logger.info(
                 "Embedding model idle for %d minute(s) — auto-unloading.",
@@ -320,6 +338,9 @@ class EmbeddingGenerator:
         try:
             return self._encode(texts, show_progress, query=query)
         finally:
+            # Idle time counts from the end of an encode, not its start, so
+            # a long ingest encode is not followed by an immediate unload.
+            self._touch()
             self._lock.release()
 
     def _encode(self, texts: list[str], show_progress: bool, *, query: bool) -> np.ndarray:
