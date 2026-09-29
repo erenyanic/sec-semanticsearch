@@ -277,7 +277,7 @@ class TestCancellation:
 
         assert info.state == TaskState.CANCELLED
         manager._rollback.assert_called_once_with(info)
-        assert _messages(info)[-1] == {"type": "cancelled"}
+        assert _messages(info)[-1]["type"] == "cancelled"
         manager._orchestrator.process_filing.assert_not_called()
 
 

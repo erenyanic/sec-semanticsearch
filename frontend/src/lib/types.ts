@@ -285,17 +285,33 @@ export interface GPUUnloadResponse {
 // WebSocket message types (server → client)
 // ---------------------------------------------------------------------------
 
-/** Sent on connect — current state snapshot for reconnection. */
+/**
+ * Sent on connect — current state snapshot for reconnection.
+ *
+ * `seq` is the sequence number of the last message the snapshot already
+ * reflects. Messages queued while no client was connected follow it; any
+ * with `seq <= snapshot.seq` must not be counted again.
+ */
 export interface WsSnapshot {
   type: "snapshot";
   task_id: string;
   status: string;
+  seq?: number;
   progress: TaskProgress;
   results: WsFilingResult[];
 }
 
-/** Pipeline step progress. */
-export interface WsStep {
+/** Per-task sequence number carried by every streamed message. */
+interface WsSequenced {
+  seq?: number;
+}
+
+/**
+ * Pipeline step progress. `step_number` is the 0-based index into the
+ * five stepper steps (0 Fetching, 1 Parsing, 2 Chunking, 3 Embedding,
+ * 4 Storing), the same scale as `TaskProgress.step_index`.
+ */
+export interface WsStep extends WsSequenced {
   type: "step";
   step: string;
   step_number: number;
@@ -305,7 +321,7 @@ export interface WsStep {
 }
 
 /** Filing successfully ingested. */
-export interface WsFilingDone {
+export interface WsFilingDone extends WsSequenced {
   type: "filing_done";
   ticker: string;
   form_type: string;
@@ -317,18 +333,20 @@ export interface WsFilingDone {
 }
 
 /** Filing skipped (duplicate). */
-export interface WsFilingSkipped {
+export interface WsFilingSkipped extends WsSequenced {
   type: "filing_skipped";
   ticker: string;
   form_type: string;
+  accession_number?: string;
   reason: string;
 }
 
 /** Filing processing failed. */
-export interface WsFilingFailed {
+export interface WsFilingFailed extends WsSequenced {
   type: "filing_failed";
   ticker: string;
   form_type: string;
+  accession_number?: string;
   error: string;
 }
 
@@ -357,7 +375,7 @@ export interface WsCancelled {
 }
 
 /** FIFO eviction occurred during demo mode ingest. */
-export interface WsEviction {
+export interface WsEviction extends WsSequenced {
   type: "eviction";
   filings_evicted: number;
   chunks_evicted: number;

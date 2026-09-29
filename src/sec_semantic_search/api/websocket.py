@@ -20,6 +20,9 @@ The client does not send messages after the initial connection.
 Disconnecting is handled gracefully — the task continues running
 server-side.  Reconnecting sends a fresh snapshot so the client
 can catch up.
+
+Every message carries a per-task ``seq``; the snapshot carries the
+``seq`` of the last message it already reflects (see ``_build_snapshot``).
 """
 
 from __future__ import annotations
@@ -49,24 +52,33 @@ def _build_snapshot(info: TaskInfo) -> dict:
 
     Sent immediately on WebSocket connect so a reconnecting client
     can catch up on progress made while it was disconnected.
+
+    ``seq`` is the sequence number of the last message the snapshot
+    reflects. Messages pushed while no client was connected are still
+    queued and are streamed after the snapshot; the client must not
+    apply the counters of any with ``seq <= snapshot.seq`` again. The
+    worker updates counters and pushes their message under the same
+    ``_event_lock`` (held here for microseconds), so the two agree.
     """
-    return {
-        "type": "snapshot",
-        "task_id": info.task_id,
-        "status": info.state.value,
-        "progress": {
-            "current_ticker": info.progress.current_ticker,
-            "current_form_type": info.progress.current_form_type,
-            "step_label": info.progress.step_label,
-            "step_index": info.progress.step_index,
-            "step_total": info.progress.step_total,
-            "filings_done": info.progress.filings_done,
-            "filings_total": info.progress.filings_total,
-            "filings_skipped": info.progress.filings_skipped,
-            "filings_failed": info.progress.filings_failed,
-        },
-        "results": [r.to_dict() for r in info.results],
-    }
+    with info._event_lock:
+        return {
+            "type": "snapshot",
+            "task_id": info.task_id,
+            "status": info.state.value,
+            "seq": info._seq,
+            "progress": {
+                "current_ticker": info.progress.current_ticker,
+                "current_form_type": info.progress.current_form_type,
+                "step_label": info.progress.step_label,
+                "step_index": info.progress.step_index,
+                "step_total": info.progress.step_total,
+                "filings_done": info.progress.filings_done,
+                "filings_total": info.progress.filings_total,
+                "filings_skipped": info.progress.filings_skipped,
+                "filings_failed": info.progress.filings_failed,
+            },
+            "results": [r.to_dict() for r in info.results],
+        }
 
 
 @router.websocket("/ws/ingest/{task_id}")

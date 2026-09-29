@@ -25,6 +25,15 @@
  * task's current state and opens a WebSocket for continued streaming.
  * This allows the user to navigate away and come back without losing
  * progress.
+ *
+ * ## Reconnection and replayed messages
+ *
+ * Every streamed message carries a per-task `seq`, and the snapshot sent
+ * on (re)connect carries the `seq` of the last message it already
+ * reflects. Messages the server queued while no client was connected are
+ * streamed after the snapshot; those with `seq <= lastSeq` are replays —
+ * their counters are already in the snapshot, so the reducer only adds a
+ * missing event row and never counts them again.
  */
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
@@ -90,6 +99,8 @@ interface IngestState {
   error: string | null;
   startedAt: Date | null;
   completedAt: Date | null;
+  /** `seq` of the last message whose effect is in this state (see above). */
+  lastSeq: number;
 }
 
 /** Exported for direct unit testing. */
@@ -116,22 +127,40 @@ export const INITIAL_STATE: IngestState = {
   error: null,
   startedAt: null,
   completedAt: null,
+  lastSeq: 0,
 };
 
 type IngestAction =
   | { type: "START"; taskId: string }
-  | { type: "SNAPSHOT"; status: string; progress: TaskProgress; results: WsFilingResult[] }
-  | { type: "STEP"; step: string; step_number: number; total_steps: number; ticker?: string; form_type?: string }
-  | { type: "FILING_DONE"; ticker: string; form_type: string; filing_date: string; accession_number: string; segments: number; chunks: number; time: number }
-  | { type: "FILING_SKIPPED"; ticker: string; form_type: string; reason: string; accession_number?: string }
-  | { type: "FILING_FAILED"; ticker: string; form_type: string; error: string; accession_number?: string }
-  | { type: "EVICTION"; filings_evicted: number; chunks_evicted: number; tickers_affected: string[] }
+  | { type: "SNAPSHOT"; status: string; progress: TaskProgress; results: WsFilingResult[]; seq?: number }
+  | { type: "STEP"; step: string; step_number: number; total_steps: number; ticker?: string; form_type?: string; seq?: number }
+  | { type: "FILING_DONE"; ticker: string; form_type: string; filing_date: string; accession_number: string; segments: number; chunks: number; time: number; seq?: number }
+  | { type: "FILING_SKIPPED"; ticker: string; form_type: string; reason: string; accession_number?: string; seq?: number }
+  | { type: "FILING_FAILED"; ticker: string; form_type: string; error: string; accession_number?: string; seq?: number }
+  | { type: "EVICTION"; filings_evicted: number; chunks_evicted: number; tickers_affected: string[]; seq?: number }
   | { type: "COMPLETED"; results: WsFilingResult[]; summary: { total: number; succeeded: number; skipped: number; failed: number } }
   | { type: "FAILED"; error: string; details?: string }
   | { type: "CANCELLED" }
   | { type: "ERROR"; error: string }
   | { type: "RESUME"; taskStatus: TaskStatus }
   | { type: "RESET" };
+
+/** A message already reflected in the last snapshot (see module doc). */
+function isReplay(state: IngestState, seq: number | undefined): boolean {
+  return seq !== undefined && seq <= state.lastSeq;
+}
+
+/** Whether a replayed filing message's event row is already present. */
+function hasFilingEvent(
+  events: FilingEvent[],
+  type: FilingEvent["type"],
+  accession: string | undefined,
+): boolean {
+  return (
+    accession !== undefined &&
+    events.some((e) => e.type === type && e.accession_number === accession)
+  );
+}
 
 /**
  * Exported for direct unit testing — not part of the public hook API.
@@ -161,29 +190,38 @@ export const reducer = produce(
         draft.status = mappedStatus;
         draft.progress = action.progress;
         draft.results = action.results;
+        draft.lastSeq = action.seq ?? 0;
         break;
       }
 
       case "STEP":
+        // A replayed step is older than the snapshot's own step.
+        if (isReplay(draft, action.seq)) break;
         draft.status = "running";
         draft.progress.step_label = action.step;
-        draft.progress.step_index = action.step_number - 1; // WS sends 1-based
+        draft.progress.step_index = action.step_number; // already 0-based
         draft.progress.step_total = action.total_steps;
         draft.progress.current_ticker = action.ticker ?? draft.progress.current_ticker;
         draft.progress.current_form_type = action.form_type ?? draft.progress.current_form_type;
+        draft.lastSeq = action.seq ?? draft.lastSeq;
         break;
 
       case "FILING_DONE":
-        draft.progress.filings_done += 1;
-        draft.results.push({
-          ticker: action.ticker,
-          form_type: action.form_type,
-          filing_date: action.filing_date,
-          accession_number: action.accession_number,
-          segments: action.segments,
-          chunks: action.chunks,
-          time: action.time,
-        });
+        if (isReplay(draft, action.seq)) {
+          if (hasFilingEvent(draft.filingEvents, "done", action.accession_number)) break;
+        } else {
+          draft.progress.filings_done += 1;
+          draft.results.push({
+            ticker: action.ticker,
+            form_type: action.form_type,
+            filing_date: action.filing_date,
+            accession_number: action.accession_number,
+            segments: action.segments,
+            chunks: action.chunks,
+            time: action.time,
+          });
+          draft.lastSeq = action.seq ?? draft.lastSeq;
+        }
         draft.filingEvents.push({
           type: "done",
           ticker: action.ticker,
@@ -197,7 +235,12 @@ export const reducer = produce(
         break;
 
       case "FILING_SKIPPED":
-        draft.progress.filings_skipped += 1;
+        if (isReplay(draft, action.seq)) {
+          if (hasFilingEvent(draft.filingEvents, "skipped", action.accession_number)) break;
+        } else {
+          draft.progress.filings_skipped += 1;
+          draft.lastSeq = action.seq ?? draft.lastSeq;
+        }
         draft.filingEvents.push({
           type: "skipped",
           ticker: action.ticker,
@@ -208,7 +251,12 @@ export const reducer = produce(
         break;
 
       case "FILING_FAILED":
-        draft.progress.filings_failed += 1;
+        if (isReplay(draft, action.seq)) {
+          if (hasFilingEvent(draft.filingEvents, "failed", action.accession_number)) break;
+        } else {
+          draft.progress.filings_failed += 1;
+          draft.lastSeq = action.seq ?? draft.lastSeq;
+        }
         draft.filingEvents.push({
           type: "failed",
           ticker: action.ticker,
@@ -219,6 +267,17 @@ export const reducer = produce(
         break;
 
       case "EVICTION":
+        if (isReplay(draft, action.seq)) {
+          const seen = draft.filingEvents.some(
+            (e) =>
+              e.type === "eviction" &&
+              e.filings_evicted === action.filings_evicted &&
+              e.chunks_evicted === action.chunks_evicted,
+          );
+          if (seen) break;
+        } else {
+          draft.lastSeq = action.seq ?? draft.lastSeq;
+        }
         draft.filingEvents.push({
           type: "eviction",
           ticker: action.tickers_affected.join(", ") || "—",
@@ -330,6 +389,7 @@ export function useIngest(): UseIngestReturn {
             status: msg.status,
             progress: msg.progress,
             results: msg.results,
+            seq: msg.seq,
           });
           break;
 
@@ -341,6 +401,7 @@ export function useIngest(): UseIngestReturn {
             total_steps: msg.total_steps,
             ticker: msg.ticker,
             form_type: msg.form_type,
+            seq: msg.seq,
           });
           break;
 
@@ -354,6 +415,7 @@ export function useIngest(): UseIngestReturn {
             segments: msg.segments,
             chunks: msg.chunks,
             time: msg.time,
+            seq: msg.seq,
           });
           break;
 
@@ -362,7 +424,9 @@ export function useIngest(): UseIngestReturn {
             type: "FILING_SKIPPED",
             ticker: msg.ticker,
             form_type: msg.form_type,
+            accession_number: msg.accession_number,
             reason: msg.reason,
+            seq: msg.seq,
           });
           break;
 
@@ -371,7 +435,9 @@ export function useIngest(): UseIngestReturn {
             type: "FILING_FAILED",
             ticker: msg.ticker,
             form_type: msg.form_type,
+            accession_number: msg.accession_number,
             error: msg.error,
+            seq: msg.seq,
           });
           break;
 
@@ -381,6 +447,7 @@ export function useIngest(): UseIngestReturn {
             filings_evicted: msg.filings_evicted,
             chunks_evicted: msg.chunks_evicted,
             tickers_affected: msg.tickers_affected,
+            seq: msg.seq,
           });
           // Invalidate status cache — filing counts have changed.
           queryClient.invalidateQueries({ queryKey: ["status"] });

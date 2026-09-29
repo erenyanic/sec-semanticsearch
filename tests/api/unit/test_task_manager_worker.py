@@ -164,7 +164,18 @@ class TestPush:
         manager._push(info, message)
 
         assert not info._message_queue.empty()
-        assert info._message_queue.get_nowait() == message
+        assert info._message_queue.get_nowait() == {**message, "seq": 1}
+        assert message == {"type": "step", "step": "Parsing"}  # caller's dict untouched
+
+    def test_seq_increments_per_task(self, manager):
+        first, second = make_task_info(task_id="a" * 12), make_task_info(task_id="b" * 12)
+        manager._push(first, {"type": "step"})
+        manager._push(first, {"type": "step"})
+        manager._push(second, {"type": "step"})
+
+        assert [first._message_queue.get_nowait()["seq"] for _ in range(2)] == [1, 2]
+        assert second._message_queue.get_nowait()["seq"] == 1
+        assert first._seq == 2
 
     def test_multiple_messages_fifo(self, manager):
         info = make_task_info()

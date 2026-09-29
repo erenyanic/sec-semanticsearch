@@ -53,7 +53,9 @@ describe("useIngest reducer", () => {
       });
       expect(next.status).toBe("running");
       expect(next.progress.step_label).toBe("Fetching filings");
-      expect(next.progress.step_index).toBe(1); // 1-based to 0-based
+      // step_number is already the 0-based stepper index (2 = Chunking),
+      // the same scale as the snapshot's progress.step_index.
+      expect(next.progress.step_index).toBe(2);
       expect(next.progress.step_total).toBe(5);
       expect(next.progress.current_ticker).toBe("AAPL");
       expect(next.progress.current_form_type).toBe("10-K");
@@ -272,6 +274,155 @@ describe("useIngest reducer", () => {
       expect(state.progress.filings_done).toBe(1);
       expect(state.progress.filings_skipped).toBe(1);
       expect(state.progress.filings_failed).toBe(1);
+    });
+  });
+  describe("reconnect replays (seq)", () => {
+    const done = (n: number, seq?: number) => ({
+      type: "FILING_DONE" as const,
+      ticker: "AAPL",
+      form_type: "10-K",
+      filing_date: "2024-11-01",
+      accession_number: `acc-${n}`,
+      segments: 1,
+      chunks: 1,
+      time: 0.1,
+      seq,
+    });
+    const result = (n: number): WsFilingResult => ({
+      ticker: "AAPL",
+      form_type: "10-K",
+      filing_date: "2024-11-01",
+      accession_number: `acc-${n}`,
+      segments: 1,
+      chunks: 1,
+      time: 0.1,
+    });
+    const snapshot = (doneCount: number, seq?: number) => ({
+      type: "SNAPSHOT" as const,
+      status: "running",
+      progress: { ...DEFAULT_PROGRESS, filings_done: doneCount, filings_total: 5 },
+      results: Array.from({ length: doneCount }, (_, i) => result(i + 1)),
+      seq,
+    });
+
+    it("stores the snapshot's seq", () => {
+      const next = reducer(INITIAL_STATE, snapshot(2, 7));
+      expect(next.lastSeq).toBe(7);
+    });
+
+    it("does not count a replayed filing_done again", () => {
+      let state = reducer(INITIAL_STATE, snapshot(2, 2));
+      state = reducer(state, done(2, 2));
+      expect(state.progress.filings_done).toBe(2);
+      expect(state.results).toHaveLength(2);
+      // The event row was missing (no prior connection) and is added once.
+      expect(state.filingEvents.map((e) => e.accession_number)).toEqual(["acc-2"]);
+      state = reducer(state, done(2, 2));
+      expect(state.filingEvents).toHaveLength(1);
+    });
+
+    it("counts a message newer than the snapshot and advances lastSeq", () => {
+      let state = reducer(INITIAL_STATE, snapshot(2, 2));
+      state = reducer(state, done(3, 3));
+      expect(state.progress.filings_done).toBe(3);
+      expect(state.results).toHaveLength(3);
+      expect(state.lastSeq).toBe(3);
+    });
+
+    it("does not count replayed skips or failures", () => {
+      let state = reducer(INITIAL_STATE, {
+        ...snapshot(0, 5),
+        progress: { ...DEFAULT_PROGRESS, filings_skipped: 1, filings_failed: 1, filings_done: 2 },
+      });
+      state = reducer(state, {
+        type: "FILING_SKIPPED",
+        ticker: "A",
+        form_type: "10-K",
+        reason: "duplicate",
+        accession_number: "acc-s",
+        seq: 3,
+      });
+      state = reducer(state, {
+        type: "FILING_FAILED",
+        ticker: "A",
+        form_type: "10-K",
+        error: "x",
+        accession_number: "acc-f",
+        seq: 4,
+      });
+      expect(state.progress.filings_skipped).toBe(1);
+      expect(state.progress.filings_failed).toBe(1);
+      expect(state.filingEvents.map((e) => e.type)).toEqual(["skipped", "failed"]);
+    });
+
+    it("ignores a replayed step so the stepper cannot move backwards", () => {
+      let state = reducer(INITIAL_STATE, {
+        ...snapshot(0, 10),
+        progress: { ...DEFAULT_PROGRESS, step_index: 3, step_label: "Embedding" },
+      });
+      state = reducer(state, { type: "STEP", step: "Parsing", step_number: 1, total_steps: 5, seq: 9 });
+      expect(state.progress.step_index).toBe(3);
+      state = reducer(state, { type: "STEP", step: "Complete", step_number: 4, total_steps: 5, seq: 11 });
+      expect(state.progress.step_index).toBe(4);
+      expect(state.lastSeq).toBe(11);
+    });
+
+    it("adds a replayed eviction once", () => {
+      const eviction = {
+        type: "EVICTION" as const,
+        filings_evicted: 501,
+        chunks_evicted: 9000,
+        tickers_affected: ["MSFT"],
+        seq: 1,
+      };
+      let state = reducer(INITIAL_STATE, snapshot(0, 1));
+      state = reducer(state, eviction);
+      state = reducer(state, eviction);
+      expect(state.filingEvents.filter((e) => e.type === "eviction")).toHaveLength(1);
+    });
+
+    it("applies messages without seq as before (older server)", () => {
+      let state = reducer(INITIAL_STATE, snapshot(2));
+      state = reducer(state, done(3));
+      expect(state.progress.filings_done).toBe(3);
+    });
+
+    it("reload mid-ingest: counters match the server exactly (audit repro)", () => {
+      // 5-filing ingest; the tab closed after filing 2 and filings 3–4
+      // finished with no client connected. The page reloads.
+      const taskStatus: TaskStatus = {
+        task_id: "t1",
+        status: "running",
+        tickers: ["AAPL"],
+        form_types: ["10-K"],
+        progress: { ...DEFAULT_PROGRESS, filings_done: 4, filings_total: 5 },
+        results: [1, 2, 3, 4].map((n) => ({
+          ticker: "AAPL",
+          form_type: "10-K",
+          filing_date: "2024-11-01",
+          accession_number: `acc-${n}`,
+          segment_count: 1,
+          chunk_count: 1,
+          duration_seconds: 0.1,
+        })),
+        error: null,
+        started_at: null,
+        completed_at: null,
+      };
+      let state = reducer(INITIAL_STATE, { type: "RESUME", taskStatus });
+      state = reducer(state, snapshot(4, 4));
+      state = reducer(state, done(3, 3)); // replay
+      state = reducer(state, done(4, 4)); // replay
+      state = reducer(state, done(5, 5)); // new
+      expect(state.progress.filings_done).toBe(5);
+      expect(state.results.map((r) => r.accession_number)).toEqual([
+        "acc-1",
+        "acc-2",
+        "acc-3",
+        "acc-4",
+        "acc-5",
+      ]);
+      expect(state.filingEvents.filter((e) => e.type === "done")).toHaveLength(5);
     });
   });
 });

@@ -166,6 +166,14 @@ class TaskInfo:
     # call_soon_threadsafe; WebSocket handler awaits them directly.
     _message_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
+    # Sequence number of the last pushed message. A counter update and the
+    # message reporting it happen under ``_event_lock``, and the WebSocket
+    # snapshot is built under it too, so ``snapshot.seq`` says exactly
+    # which queued messages the snapshot already reflects (a reconnecting
+    # client must not count them twice).
+    _seq: int = field(default=0, repr=False)
+    _event_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
 
 # ---------------------------------------------------------------------------
 # One-ahead fetch
@@ -503,14 +511,50 @@ class TaskManager:
         event loop thread — required because ``asyncio.Queue`` is not
         thread-safe.  Falls back to a direct ``put_nowait`` when no
         event loop is available (e.g. in unit tests).
+
+        Every message gets the task's next ``seq``. Scheduling happens
+        under ``_event_lock`` so queue order matches ``seq`` order even
+        when two threads push.
         """
-        loop = self._loop
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(info._message_queue.put_nowait, message)
-        else:
-            # Fallback: direct put (safe when no coroutine is awaiting
-            # queue.get(), e.g. in unit tests).
-            info._message_queue.put_nowait(message)
+        with info._event_lock:
+            info._seq += 1
+            message = {**message, "seq": info._seq}
+            loop = self._loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(info._message_queue.put_nowait, message)
+            else:
+                # Fallback: direct put (safe when no coroutine is awaiting
+                # queue.get(), e.g. in unit tests).
+                info._message_queue.put_nowait(message)
+
+    def _record_outcome(
+        self,
+        info: TaskInfo,
+        message: dict,
+        result: FilingResult | None = None,
+    ) -> None:
+        """
+        Count one filing's outcome and push the message that reports it.
+
+        ``filing_done`` appends ``result``; ``filing_skipped`` and
+        ``filing_failed`` bump their counters. Both steps happen under
+        ``_event_lock``, so a WebSocket snapshot sees either neither or
+        both — never the count without the ``seq`` that reported it.
+        """
+        kind = message["type"]
+        with info._event_lock:
+            if kind == "filing_done":
+                if result is None:
+                    raise ValueError("filing_done needs a result")
+                info.results.append(result)
+            elif kind == "filing_skipped":
+                info.progress.filings_skipped += 1
+            elif kind == "filing_failed":
+                info.progress.filings_failed += 1
+            else:
+                raise ValueError(f"Not a filing outcome: {kind!r}")
+            info.progress.filings_done += 1
+            self._push(info, message)
 
     # ------------------------------------------------------------------
     # Worker
@@ -664,9 +708,7 @@ class TaskManager:
 
                 # --- Duplicate check -----------------------------------------
                 if filing_id.accession_number in existing:
-                    info.progress.filings_skipped += 1
-                    info.progress.filings_done += 1
-                    self._push(
+                    self._record_outcome(
                         info,
                         {
                             "type": "filing_skipped",
@@ -733,9 +775,7 @@ class TaskManager:
                     logger.info("Task %s cancelled", info.task_id[:8])
                     return
                 except FetchError as exc:
-                    info.progress.filings_failed += 1
-                    info.progress.filings_done += 1
-                    self._push(
+                    self._record_outcome(
                         info,
                         {
                             "type": "filing_failed",
@@ -764,26 +804,27 @@ class TaskManager:
                     _form: str = form_type,
                 ) -> None:
                     """Feed pipeline progress into task state."""
-                    _info.progress.current_ticker = _ticker
-                    _info.progress.current_form_type = _form
-                    _info.progress.step_label = step
                     # Pipeline reports steps 1–4 (parse, chunk, embed, complete).
-                    # We add fetching as step 0 and storing as step 4, giving
-                    # 5 total: 0=fetch, 1=parse, 2=chunk, 3=embed, 4=store.
-                    _info.progress.step_index = current  # 1-based from pipeline
-                    _info.progress.step_total = 5
-
-                    _self._push(
-                        _info,
-                        {
-                            "type": "step",
-                            "ticker": _ticker,
-                            "form_type": _form,
-                            "step": step,
-                            "step_number": current,
-                            "total_steps": 5,
-                        },
-                    )
+                    # With fetching as 0 and storing as 4 these are the
+                    # 0-based stepper indices: 0=fetch, 1=parse, 2=chunk,
+                    # 3=embed, 4=store. ``step_number`` carries the same index.
+                    with _info._event_lock:
+                        _info.progress.current_ticker = _ticker
+                        _info.progress.current_form_type = _form
+                        _info.progress.step_label = step
+                        _info.progress.step_index = current
+                        _info.progress.step_total = 5
+                        _self._push(
+                            _info,
+                            {
+                                "type": "step",
+                                "ticker": _ticker,
+                                "form_type": _form,
+                                "step": step,
+                                "step_number": current,
+                                "total_steps": 5,
+                            },
+                        )
 
                     # Check cancellation between pipeline steps.
                     if _info.cancel_event.is_set():
@@ -806,9 +847,7 @@ class TaskManager:
                     logger.info("Task %s cancelled during processing", info.task_id[:8])
                     return
                 except SECSemanticSearchError as exc:
-                    info.progress.filings_failed += 1
-                    info.progress.filings_done += 1
-                    self._push(
+                    self._record_outcome(
                         info,
                         {
                             "type": "filing_failed",
@@ -852,9 +891,7 @@ class TaskManager:
                     if not registered:
                         # Another thread registered this filing between the
                         # batch duplicate check and now — treat as a skip.
-                        info.progress.filings_skipped += 1
-                        info.progress.filings_done += 1
-                        self._push(
+                        self._record_outcome(
                             info,
                             {
                                 "type": "filing_skipped",
@@ -879,9 +916,7 @@ class TaskManager:
                         self._registry.remove_filing(filing_id.accession_number)
                         raise
                 except DatabaseError as exc:
-                    info.progress.filings_failed += 1
-                    info.progress.filings_done += 1
-                    self._push(
+                    self._record_outcome(
                         info,
                         {
                             "type": "filing_failed",
@@ -902,20 +937,7 @@ class TaskManager:
                 # Record success and update the cached filing count.
                 cached_count += 1
                 info._stored_accessions.append(filing_id.accession_number)
-                info.results.append(
-                    FilingResult(
-                        ticker=filing_id.ticker,
-                        form_type=filing_id.form_type,
-                        filing_date=filing_id.date_str,
-                        accession_number=filing_id.accession_number,
-                        segment_count=result.ingest_result.segment_count,
-                        chunk_count=result.ingest_result.chunk_count,
-                        duration_seconds=result.ingest_result.duration_seconds,
-                    )
-                )
-                info.progress.filings_done += 1
-
-                self._push(
+                self._record_outcome(
                     info,
                     {
                         "type": "filing_done",
@@ -927,6 +949,15 @@ class TaskManager:
                         "chunks": result.ingest_result.chunk_count,
                         "time": round(result.ingest_result.duration_seconds, 1),
                     },
+                    FilingResult(
+                        ticker=filing_id.ticker,
+                        form_type=filing_id.form_type,
+                        filing_date=filing_id.date_str,
+                        accession_number=filing_id.accession_number,
+                        segment_count=result.ingest_result.segment_count,
+                        chunk_count=result.ingest_result.chunk_count,
+                        duration_seconds=result.ingest_result.duration_seconds,
+                    ),
                 )
 
                 logger.info(
