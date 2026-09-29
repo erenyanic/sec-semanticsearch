@@ -27,6 +27,8 @@ Usage:
     total_chunks = delete_filings_batch(filings, chroma=client, registry=registry)
 """
 
+import logging
+
 from sec_semantic_search.core import get_logger
 from sec_semantic_search.database.client import ChromaDBClient
 from sec_semantic_search.database.metadata import (
@@ -74,14 +76,23 @@ def delete_filings_batch(
     chroma.delete_filings_batch(accession_numbers)
     registry.remove_filings_batch(accession_numbers)
 
-    for filing in filings:
-        logger.info(
-            "Deleted %s %s (%s) — %d chunks",
-            filing.ticker,
-            filing.form_type,
-            filing.filing_date,
-            filing.chunk_count,
-        )
+    # One summary line: a demo-mode eviction deletes 500+ filings at a time,
+    # and a line per filing would add nothing an operator acts on.
+    logger.info(
+        "Deleted %d filing(s) across %d ticker(s) — %d chunks",
+        len(filings),
+        len({f.ticker for f in filings}),
+        total_chunks,
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        for filing in filings:
+            logger.debug(
+                "Deleted %s %s (%s) — %d chunks",
+                filing.ticker,
+                filing.form_type,
+                filing.filing_date,
+                filing.chunk_count,
+            )
 
     return total_chunks
 

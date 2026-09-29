@@ -6,6 +6,7 @@ We mock heavy dependencies (fetcher, databases, embedder) to keep tests
 fast while verifying exit codes, output messages, and command routing.
 """
 
+import logging
 import re
 from unittest.mock import MagicMock, patch
 
@@ -350,6 +351,60 @@ class TestDeleteFilingsBatch:
         assert total == 0
         mock_chroma.delete_filings_batch.assert_not_called()
         mock_registry.remove_filings_batch.assert_not_called()
+
+    @staticmethod
+    def _records(n):
+        return [
+            make_filing_record(
+                id=i,
+                ticker=f"T{i % 3}",
+                accession_number=f"ACC-{i:04d}",
+                chunk_count=10,
+            )
+            for i in range(n)
+        ]
+
+    def _delete_and_capture(self, n, level):
+        """Delete ``n`` filings and return the chunk total and log records."""
+        records: list[logging.LogRecord] = []
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger("sec_semantic_search.database")
+        handler = _Handler(level=logging.DEBUG)
+        previous = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(level)
+        try:
+            total = delete_filings_batch(self._records(n), registry=MagicMock(), chroma=MagicMock())
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+        return total, records
+
+    def test_bulk_delete_logs_one_info_summary(self):
+        """A 500-filing eviction emits one INFO line, not 500."""
+        total, records = self._delete_and_capture(500, logging.INFO)
+
+        info = [r for r in records if r.levelno == logging.INFO]
+        assert total == 5000
+        assert len(info) == 1
+        assert info[0].getMessage() == "Deleted 500 filing(s) across 3 ticker(s) — 5000 chunks"
+
+    def test_summary_names_no_ticker(self):
+        """Ticker names stay out of the INFO summary (research pattern, AD#29)."""
+        _, records = self._delete_and_capture(3, logging.INFO)
+        messages = [r.getMessage() for r in records]
+        assert not any("T0" in m or "T1" in m for m in messages)
+
+    def test_per_filing_detail_at_debug(self):
+        _, records = self._delete_and_capture(4, logging.DEBUG)
+
+        debug = [r for r in records if r.levelno == logging.DEBUG]
+        assert len(debug) == 4
+        assert all(r.getMessage().startswith("Deleted T") for r in debug)
 
 
 # -----------------------------------------------------------------------
