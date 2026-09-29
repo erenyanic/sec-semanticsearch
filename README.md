@@ -235,6 +235,7 @@ The package is also available programmatically.
 ```python
 from sec_semantic_search.pipeline import FilingFetcher, PipelineOrchestrator
 from sec_semantic_search.database import ChromaDBClient, MetadataRegistry
+from sec_semantic_search.ingest import store_processed_filing
 from sec_semantic_search.search import SearchEngine
 
 # 1. Fetch a filing, then process it (parse → chunk → embed)
@@ -245,16 +246,12 @@ print(f"Segments: {result.ingest_result.segment_count}")
 print(f"Chunks:   {result.ingest_result.chunk_count}")
 print(f"Time:     {result.ingest_result.duration_seconds:.1f}s")
 
-# 2. Store in both databases (ChromaDB first, then SQLite)
-chroma = ChromaDBClient()
-chroma.store_filing(result)
-
+# 2. Store in both databases: SQLite first (with the parent segments shown
+#    alongside each search result), then ChromaDB; SQLite is rolled back if
+#    ChromaDB fails. Returns False if the filing is already stored.
 registry = MetadataRegistry()
-registry.register_filing(
-    result.filing_id,
-    result.ingest_result.chunk_count,
-    segments=result.segments,  # parent context shown with each search result
-)
+chroma = ChromaDBClient()
+stored = store_processed_filing(result, registry=registry, chroma=chroma)
 
 # 3. Search across all stored filings
 engine = SearchEngine()
@@ -482,9 +479,9 @@ python -m pytest tests/integration/
 python -m pytest tests/api/
 ```
 
-**Backend:** 1,132 tests.
+**Backend:** 1,397 tests.
 
-**Frontend:** 202 tests (Vitest + React Testing Library):
+**Frontend:** 262 tests (Vitest + React Testing Library):
 
 ```bash
 cd frontend
@@ -502,11 +499,12 @@ SEC-SemanticSearch/
 ├── Dockerfile.api                    # API image (Python 3.12 slim + SQLCipher)
 ├── Dockerfile.frontend               # Frontend image (Node.js Alpine, standalone)
 ├── docker-compose.yml                # 3-service stack (api + frontend + nginx)
-├── nginx.conf                        # Reverse proxy config (API/WS routing, TLS template)
+├── nginx.conf                        # Reverse proxy config (API/WS routing, admin routes, TLS template)
 ├── src/sec_semantic_search/
 │   ├── config/                       # Pydantic settings and constants
 │   ├── core/                         # Types, exceptions, logging
 │   ├── pipeline/                     # Fetch, parse, chunk, embed, orchestrate
+│   ├── ingest/                       # Shared ingest runner (CLI and API)
 │   ├── database/                     # ChromaDB client, SQLite metadata registry
 │   ├── search/                       # SearchEngine facade
 │   ├── cli/                          # Typer CLI (ingest, search, manage)
@@ -515,7 +513,8 @@ SEC-SemanticSearch/
 │   ├── src/app/                      # Next.js pages (Dashboard, Search, Ingest, Filings)
 │   ├── src/components/               # Shared and page-scoped UI components
 │   ├── src/hooks/                    # React Query hooks
-│   └── src/lib/                      # API client, types, WebSocket client
+│   └── src/lib/                      # API client, types, WebSocket client, CSP, theme
+├── scripts/                          # Cloud Run deploy/secrets, demo reset, store measurement
 ├── tests/
 │   ├── unit/
 │   ├── integration/
