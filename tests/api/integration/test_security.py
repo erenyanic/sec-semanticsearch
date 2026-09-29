@@ -7,6 +7,8 @@ Tests verify that the fix is in place and working correctly.
 
 import logging
 import re
+import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2014,20 +2016,83 @@ class TestCSPUnsafeInlineRemoved:
 
     def test_nginx_csp_no_unsafe_inline_in_script_src(self):
         """nginx.conf CSP script-src must not contain 'unsafe-inline'."""
-        nginx_conf = Path(__file__).parents[3] / "nginx.conf"
-        content = nginx_conf.read_text()
-        # Find CSP lines and check script-src
-        for line in content.splitlines():
-            if "Content-Security-Policy" in line and "script-src" in line:
-                # Extract the script-src directive
-                idx = line.index("script-src")
-                rest = line[idx:]
-                # script-src ends at the next semicolon
-                end = rest.find(";")
-                script_src = rest[:end] if end != -1 else rest
-                assert "'unsafe-inline'" not in script_src, (
-                    f"nginx script-src still contains 'unsafe-inline': {script_src}"
-                )
+        policy = _nginx_api_csp()
+        script_src = next(
+            d.strip() for d in policy.split(";") if d.strip().startswith("script-src")
+        )
+        assert "'unsafe-inline'" not in script_src, (
+            f"nginx script-src still contains 'unsafe-inline': {script_src}"
+        )
+
+
+def _nginx_api_csp() -> str:
+    """The policy nginx.conf's ``$api_csp`` map sets for /api/ and /ws/."""
+    content = (Path(__file__).parents[3] / "nginx.conf").read_text()
+    block = re.search(r"map \$uri \$api_csp \{(.*?)\n\}", content, re.S)
+    assert block, "nginx.conf has no $api_csp map"
+    return re.search(r'~\^/\(api\|ws\)/\s+"([^"]+)";', block.group(1)).group(1)
+
+
+class TestNginxCspScope:
+    """nginx sets its static CSP on API and WebSocket responses only.
+
+    Next.js pages carry inline scripts (the RSC payload) that only a
+    per-request nonce can allow; frontend/src/proxy.ts sets that policy.
+    A static nginx policy on pages as well would block hydration, since a
+    browser enforces every policy it receives.
+    """
+
+    @pytest.fixture(scope="class")
+    def nginx_conf(self):
+        return (Path(__file__).parents[3] / "nginx.conf").read_text()
+
+    def test_map_scopes_the_policy_to_api_and_ws(self, nginx_conf):
+        block = re.search(r"map \$uri \$api_csp \{(.*?)\n\}", nginx_conf, re.S).group(1)
+        entries = [line.split(None, 1) for line in block.strip().splitlines()]
+        assert [key for key, _ in entries] == ["~^/(api|ws)/", "default"]
+        # An empty value makes nginx omit the header: pages get none from nginx.
+        assert entries[1][1].strip() == '"";'
+
+    def test_api_policy_matches_fastapi(self):
+        """Direct and proxied API responses carry the same policy."""
+        resp = TestClient(app).get("/api/health")
+        directives = lambda p: {d.strip() for d in p.split(";") if d.strip()}  # noqa: E731
+        assert directives(_nginx_api_csp()) == directives(resp.headers["Content-Security-Policy"])
+
+    def test_every_csp_header_uses_the_map(self, nginx_conf):
+        """HTTP server and the commented TLS template alike: no static page policy."""
+        lines = [
+            line.lstrip("#").strip()
+            for line in nginx_conf.splitlines()
+            if "add_header Content-Security-Policy" in line
+        ]
+        assert lines == ["add_header Content-Security-Policy $api_csp always;"] * 2
+
+    def test_nginx_accepts_the_config(self, nginx_conf, tmp_path):
+        """Syntax check with a real nginx, when one is installed."""
+        nginx = shutil.which("nginx") or next(
+            (p for p in ("/usr/sbin/nginx",) if Path(p).exists()), None
+        )
+        if nginx is None:
+            pytest.skip("nginx not installed")
+        site = (
+            nginx_conf.replace("server api:8000;", "server 127.0.0.1:1;")
+            .replace("server frontend:3000;", "server 127.0.0.1:2;")
+            .replace("listen 80;", "listen 127.0.0.1:18081;")
+        )
+        (tmp_path / "site.conf").write_text(site)
+        (tmp_path / "nginx.conf").write_text(
+            f"pid {tmp_path}/nginx.pid;\nerror_log {tmp_path}/error.log;\n"
+            "events {}\n"
+            f"http {{\n access_log off;\n client_body_temp_path {tmp_path};\n"
+            f" proxy_temp_path {tmp_path};\n include {tmp_path}/site.conf;\n}}\n"
+        )
+        result = subprocess.run(
+            [nginx, "-t", "-p", str(tmp_path), "-c", str(tmp_path / "nginx.conf")],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 # -----------------------------------------------------------------------

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { connection } from "next/server";
 import { Providers } from "@/components/Providers";
 import { Navbar, Footer, WelcomeGate, DemoBanner } from "@/components/layout";
 import "./globals.css";
@@ -56,12 +57,20 @@ export const metadata: Metadata = {
  *
  * This is a Server Component (no "use client").  The `<Providers>`
  * wrapper handles the client-side boundary.
+ *
+ * ## Dynamic rendering
+ *
+ * Every page is rendered per request: the CSP nonce (`proxy.ts`) is new
+ * for each response, and Next.js can only add it to its inline scripts
+ * while rendering. A prerendered page would carry scripts the policy
+ * blocks.
  */
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  await connection();
   return (
     <html lang="en" suppressHydrationWarning>
       <body
