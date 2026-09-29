@@ -102,6 +102,20 @@ class TestApiServiceYaml:
         annotations = api_service["spec"]["template"]["metadata"]["annotations"]
         assert annotations["autoscaling.knative.dev/minScale"] == "0"
 
+    def test_container_concurrency_bounded(self, api_service):
+        """The GPU serializes embedding, so a deep per-instance queue
+        only lengthens waits; Cloud Run should shed load with 429 instead."""
+        concurrency = api_service["spec"]["template"]["spec"]["containerConcurrency"]
+        assert 8 <= concurrency <= 16
+
+    def test_container_concurrency_fits_progress_streams(self, api_service):
+        """Every open WebSocket holds a slot: leave room for one progress
+        stream per queued ingest plus searches and page loads."""
+        spec = api_service["spec"]["template"]["spec"]
+        env = _get_env_dict(_get_container(api_service, "api"))
+        queue = int(env["API_MAX_TASK_QUEUE_SIZE"])
+        assert spec["containerConcurrency"] >= queue + 8
+
     def test_timeout_sufficient_for_ingest(self, api_service):
         """Timeout must be >= 3600s for long-running ingest tasks."""
         timeout = api_service["spec"]["template"]["spec"]["timeoutSeconds"]

@@ -62,7 +62,14 @@ spec:
         run.googleapis.com/startup-cpu-boost: "true"
 
     spec:
-      containerConcurrency: 80
+      # Requests one instance serves at once. The GPU embeds one
+      # search or ingest at a time (AD#15, AD#46) and searches queue in
+      # the threadpool behind it, so letting 80 in only lengthened that
+      # queue; past 16, Cloud Run answers 429 at the edge. Each open
+      # WebSocket counts for its whole lifetime: 16 leaves room for one
+      # progress stream per queued ingest (API_MAX_TASK_QUEUE_SIZE=5) plus
+      # searches and page loads.
+      containerConcurrency: 16
       timeoutSeconds: 3600
 
       serviceAccountName: sec-search-sa@PROJECT_ID.iam.gserviceaccount.com
