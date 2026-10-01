@@ -4,6 +4,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -107,14 +108,15 @@ def list_filings(
     table.add_column("Chunks", justify="right", style="bold")
     table.add_column("Ingested At", style="dim")
 
+    # Text cells: stored values are data, never Rich markup.
     for f in filings:
         table.add_row(
-            f.ticker,
-            f.form_type,
-            f.filing_date,
-            f.accession_number,
+            Text(f.ticker),
+            Text(f.form_type),
+            Text(f.filing_date),
+            Text(f.accession_number),
             str(f.chunk_count),
-            f.ingested_at,
+            Text(f.ingested_at),
         )
 
     console.print(table)
@@ -175,7 +177,7 @@ def remove(
     if accession_number is not None:
         filing = registry.get_filing(accession_number)
         if filing is None:
-            console.print(f"[red]Filing not found:[/red] {accession_number}")
+            console.print(f"[red]Filing not found:[/red] {escape(accession_number)}")
             console.print(
                 "  [dim italic]Hint: Run 'sec-search manage list' to see available "
                 "accession numbers.[/dim italic]"
@@ -201,15 +203,15 @@ def remove(
             chroma = ChromaDBClient()
             delete_filings_batch([filing], chroma=chroma, registry=registry)
         except DatabaseError as e:
-            console.print(f"[red]Removal failed:[/red] {e.message}")
+            console.print(f"[red]Removal failed:[/red] {escape(e.message)}")
             console.print(
                 "  [dim italic]Hint: Check that the data directory is writable.[/dim italic]"
             )
             raise typer.Exit(code=1) from None
 
         console.print(
-            f"[green]Removed:[/green] {filing.ticker} {filing.form_type} "
-            f"({filing.filing_date}) — {filing.chunk_count} chunks deleted"
+            f"[green]Removed:[/green] {escape(f'{filing.ticker} {filing.form_type}')} "
+            f"({escape(filing.filing_date)}) — {filing.chunk_count} chunks deleted"
         )
         return
 
@@ -228,16 +230,16 @@ def remove(
             ]
             if part
         )
-        console.print(f"[yellow]No filings found matching {filter_desc}.[/yellow]")
+        console.print(f"[yellow]No filings found matching {escape(filter_desc)}.[/yellow]")
         return
 
     # Show what will be deleted.
     total_chunks = sum(f.chunk_count for f in filings)
     filter_parts: list[str] = []
     if ticker:
-        filter_parts.append(f"ticker=[cyan]{ticker.upper()}[/cyan]")
+        filter_parts.append(f"ticker=[cyan]{escape(ticker.upper())}[/cyan]")
     if form:
-        filter_parts.append(f"form=[green]{form.upper()}[/green]")
+        filter_parts.append(f"form=[green]{escape(form.upper())}[/green]")
     filter_desc = ", ".join(filter_parts)
 
     console.print(
@@ -247,7 +249,8 @@ def remove(
 
     for f in filings:
         console.print(
-            f"  [dim]•[/dim] {f.ticker} {f.form_type} ({f.filing_date}) — {f.chunk_count} chunks"
+            f"  [dim]•[/dim] {escape(f'{f.ticker} {f.form_type} ({f.filing_date})')} "
+            f"— {f.chunk_count} chunks"
         )
 
     console.print()
@@ -266,7 +269,7 @@ def remove(
             chroma=chroma,
         )
     except DatabaseError as e:
-        console.print(f"[red]Removal failed:[/red] {e.message}")
+        console.print(f"[red]Removal failed:[/red] {escape(e.message)}")
         console.print("  [dim italic]Hint: Check that the data directory is writable.[/dim italic]")
         raise typer.Exit(code=1) from None
 
@@ -304,7 +307,7 @@ def clear(
     console.print(
         f"\n[bold red]Clear Database[/bold red]\n"
         f"  {len(filings)} filing(s), {total_chunks} chunks, "
-        f"{len(unique_tickers)} ticker(s): {', '.join(unique_tickers)}\n"
+        f"{len(unique_tickers)} ticker(s): {escape(', '.join(unique_tickers))}\n"
     )
 
     if not yes:
@@ -321,7 +324,7 @@ def clear(
             chroma=chroma,
         )
     except DatabaseError as e:
-        console.print(f"[red]Clear failed:[/red] {e.message}")
+        console.print(f"[red]Clear failed:[/red] {escape(e.message)}")
         console.print("  [dim italic]Hint: Check that the data directory is writable.[/dim italic]")
         raise typer.Exit(code=1) from None
 

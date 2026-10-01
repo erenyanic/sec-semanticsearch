@@ -1002,3 +1002,173 @@ class TestSimilarityText:
         text = _similarity_text(0.10)
         assert "10.0%" in str(text)
         assert text.style == "dim"
+
+
+# -----------------------------------------------------------------------
+# Rich markup in data (security audit 2026-09-16, observation)
+# -----------------------------------------------------------------------
+
+
+class TestDataIsNotRichMarkup:
+    """Filing-derived, stored and exception text must print literally.
+
+    Rich parses ``[...]`` in strings handed to ``console.print`` or
+    ``Table.add_row``. A section title such as
+    ``[link=https://attacker.example]Item 1A[/link]`` rendered as a
+    clickable terminal hyperlink, and lowercase ``[tag]`` sequences vanished.
+    """
+
+    LINK = "[link=https://x.io]A[/link]"
+    BOLD = "[bold]B[/bold]"
+
+    @staticmethod
+    def _wide_console():
+        from rich.console import Console
+
+        # Wide enough that no table cell wraps through a payload.
+        return Console(width=400)
+
+    @pytest.fixture
+    def _isolate_registry(self):
+        with patch("sec_semantic_search.database.MetadataRegistry") as MockRegistry:
+            MockRegistry.return_value = MagicMock()
+            yield MockRegistry
+
+    def _search(self, results, query="risk"):
+        with (
+            patch("sec_semantic_search.cli.search.console", self._wide_console()),
+            patch("sec_semantic_search.cli.search.SearchEngine") as MockEngine,
+        ):
+            MockEngine.return_value.search.return_value = results
+            return runner.invoke(app, ["search", query])
+
+    def test_search_section_and_source_print_literally(self, _isolate_registry):
+        from sec_semantic_search.core.types import ContentType, SearchResult
+
+        result = self._search(
+            [
+                SearchResult(
+                    content="Body text.",
+                    path=self.LINK,
+                    content_type=ContentType.TEXT,
+                    ticker="AAPL",
+                    form_type="[u]10-K[/u]",
+                    similarity=0.5,
+                )
+            ]
+        )
+        output = _strip_ansi(result.output)
+        assert result.exit_code == 0
+        assert self.LINK in output
+        assert "AAPL [u]10-K[/u]" in output
+        assert "\x1b]8;" not in result.output  # no OSC-8 hyperlink
+
+    def test_search_query_echo_prints_literally(self, _isolate_registry):
+        from sec_semantic_search.core.types import ContentType, SearchResult
+
+        hit = SearchResult(
+            content="x",
+            path="Item 1",
+            content_type=ContentType.TEXT,
+            ticker="AAPL",
+            form_type="10-K",
+            similarity=0.5,
+        )
+        result = self._search([hit], query=self.BOLD)
+        assert f"for: {self.BOLD}" in _strip_ansi(result.output)
+
+    def test_search_error_text_prints_literally(self, _isolate_registry):
+        from sec_semantic_search.core.exceptions import SearchError
+
+        with (
+            patch("sec_semantic_search.cli.search.console", self._wide_console()),
+            patch("sec_semantic_search.cli.search.SearchEngine") as MockEngine,
+        ):
+            MockEngine.return_value.search.side_effect = SearchError(
+                f"failed {self.LINK}", details=self.BOLD
+            )
+            result = runner.invoke(app, ["search", "q"])
+        output = _strip_ansi(result.output)
+        assert f"failed {self.LINK}" in output
+        assert self.BOLD in output
+
+    def test_encryption_extra_hint_keeps_its_brackets(self, _isolate_registry):
+        """The CLI's own hint lost "[encryption]" to the markup parser."""
+        from sec_semantic_search.core.exceptions import DatabaseError
+
+        _isolate_registry.side_effect = DatabaseError("file is not a database")
+        with (
+            patch("sec_semantic_search.cli.search.console", self._wide_console()),
+            patch("sec_semantic_search.cli.search.SearchEngine"),
+        ):
+            result = runner.invoke(app, ["search", "q"])
+        assert "pip install sec-semantic-search[encryption]" in _strip_ansi(result.output)
+
+    def test_manage_list_cells_print_literally(self):
+        with (
+            patch("sec_semantic_search.cli.manage.console", self._wide_console()),
+            patch("sec_semantic_search.cli.manage.MetadataRegistry") as MockReg,
+        ):
+            MockReg.return_value.list_filings.return_value = [
+                make_filing_record(ticker=self.BOLD, accession_number=self.LINK)
+            ]
+            result = runner.invoke(app, ["manage", "list"])
+        output = _strip_ansi(result.output)
+        assert self.BOLD in output
+        assert self.LINK in output
+
+    def test_manage_remove_not_found_echoes_literally(self):
+        with (
+            patch("sec_semantic_search.cli.manage.console", self._wide_console()),
+            patch("sec_semantic_search.cli.manage.MetadataRegistry") as MockReg,
+        ):
+            MockReg.return_value.get_filing.return_value = None
+            result = runner.invoke(app, ["manage", "remove", self.BOLD])
+        assert f"Filing not found: {self.BOLD}" in _strip_ansi(result.output)
+
+    def test_manage_bulk_remove_lists_filings_literally(self):
+        with (
+            patch("sec_semantic_search.cli.manage.console", self._wide_console()),
+            patch("sec_semantic_search.cli.manage.MetadataRegistry") as MockReg,
+        ):
+            MockReg.return_value.list_filings.return_value = [
+                make_filing_record(form_type=self.BOLD)
+            ]
+            result = runner.invoke(app, ["manage", "remove", "--ticker", "AAPL"], input="n\n")
+        assert f"AAPL {self.BOLD}" in _strip_ansi(result.output)
+
+    def test_ingest_failure_lines_print_literally(self):
+        from datetime import date
+
+        from rich.console import Console
+
+        from sec_semantic_search.cli.ingest import _CliReporter, _make_progress
+        from sec_semantic_search.core import SECSemanticSearchError
+        from sec_semantic_search.pipeline.fetch import FilingInfo
+
+        console = Console(width=400, record=True, file=open("/dev/null", "w"))  # noqa: SIM115
+        with patch("sec_semantic_search.cli.ingest.console", console):
+            progress = _make_progress()
+        reporter = _CliReporter(progress)
+        filing = FilingInfo(
+            ticker="AAPL",
+            form_type=self.BOLD,
+            filing_date=date(2024, 11, 1),
+            accession_number=self.LINK,
+            company_name="Apple Inc.",
+        )
+        reporter.filing_started(0, 1, filing)
+        reporter.failed(
+            filing, "processing", SECSemanticSearchError(f"bad {self.LINK}", details=self.BOLD)
+        )
+        reporter.skipped(filing, "duplicate")
+        text = console.export_text()
+        console.file.close()
+        assert f"AAPL {self.BOLD} — bad {self.LINK}" in text
+        assert f"    {self.BOLD}" in text
+        assert f"({filing.filing_date.isoformat()}, {self.LINK})" in text
+        # Progress descriptions are markup too: they must render to the literal.
+        from rich.text import Text
+
+        rendered = Text.from_markup(progress.tasks[0].description).plain
+        assert rendered == f"Filings: AAPL {self.BOLD}"

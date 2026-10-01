@@ -4,6 +4,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
@@ -107,17 +108,17 @@ def search(
                 end_date=end_date,
             )
         except DatabaseError as e:
-            console.print(f"[red]Search failed:[/red] {e.message}")
+            console.print(f"[red]Search failed:[/red] {escape(e.message)}")
             console.print(
                 "  [dim italic]Hint: Check that the metadata database is readable. "
                 "If DB_ENCRYPTION_KEY is set, install the encryption extra with "
-                "'pip install sec-semantic-search[encryption]'.[/dim italic]"
+                "'pip install sec-semantic-search\\[encryption]'.[/dim italic]"
             )
             raise typer.Exit(code=1) from None
         except SearchError as e:
-            console.print(f"[red]Search failed:[/red] {e.message}")
+            console.print(f"[red]Search failed:[/red] {escape(e.message)}")
             if e.details:
-                console.print(f"  [dim]{e.details}[/dim]")
+                console.print(f"  [dim]{escape(e.details)}[/dim]")
             console.print(
                 "  [dim italic]Hint: Ensure filings have been ingested with "
                 "'sec-search ingest add'.[/dim italic]"
@@ -132,7 +133,9 @@ def search(
         )
         return
 
-    console.print(f"\n[bold]Found {len(results)} result(s)[/bold] for: [italic]{query}[/italic]\n")
+    console.print(
+        f"\n[bold]Found {len(results)} result(s)[/bold] for: [italic]{escape(query)}[/italic]\n"
+    )
 
     table = Table(show_lines=True, expand=True, border_style="dim")
     table.add_column("#", style="bold", width=3, justify="right")
@@ -162,11 +165,14 @@ def search(
         if len(section) > _SECTION_PATH_LIMIT:
             section = section[:_SECTION_PATH_LIMIT] + "..."
 
+        # Filing-derived strings go in as Text, never as markup: a section
+        # title like "[link=https://…]Item 1A[/link]" would otherwise render
+        # as a terminal hyperlink, and lowercase "[tag]"s would vanish.
         table.add_row(
             str(i),
             _similarity_text(result.similarity),
-            source,
-            section,
+            Text(source),
+            Text(section),
             content_text,
         )
 

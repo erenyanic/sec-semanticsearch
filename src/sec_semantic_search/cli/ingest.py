@@ -11,6 +11,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     Progress,
@@ -87,16 +88,19 @@ class _CliReporter(IngestObserver):
 
     @staticmethod
     def _label(filing: FilingInfo) -> str:
-        return f"{filing.ticker} {filing.form_type}"
+        # Escaped: labels go into Rich markup (console lines and progress
+        # descriptions), and EDGAR supplies the form type.
+        return escape(f"{filing.ticker} {filing.form_type}")
 
     def listing(self, ticker: str, form_type: str | None) -> None:
         forms = form_type or "all forms"
-        self._progress.update(self._filings, description=f"Listing {ticker} {forms}...")
+        self._progress.update(self._filings, description=escape(f"Listing {ticker} {forms}..."))
 
     def listing_failed(self, ticker: str, form_type: str, error: FetchError) -> None:
         self.listing_failures += 1
         self._progress.console.print(
-            f"  [red]{ticker} {form_type}: listing failed —[/red] {error.message}"
+            f"  [red]{escape(ticker)} {escape(form_type)}: listing failed —[/red] "
+            f"{escape(error.message)}"
         )
         self._progress.console.print(f"  [dim italic]Hint: {_FAILURE_HINTS['fetch']}[/dim italic]")
 
@@ -121,16 +125,16 @@ class _CliReporter(IngestObserver):
     def skipped(self, filing: FilingInfo, reason: str) -> None:
         self._progress.console.print(
             f"  [yellow]Already ingested{self._tag}:[/yellow] {self._label(filing)} "
-            f"({filing.filing_date.isoformat()}, {filing.accession_number})"
+            f"({filing.filing_date.isoformat()}, {escape(filing.accession_number)})"
         )
 
     def failed(self, filing: FilingInfo, stage: str, error: SECSemanticSearchError) -> None:
         self._progress.console.print(
             f"  [red]{stage.capitalize()} failed{self._tag}:[/red] {self._label(filing)} — "
-            f"{error.message}"
+            f"{escape(error.message)}"
         )
         if error.details:
-            self._progress.console.print(f"    [dim]{error.details}[/dim]")
+            self._progress.console.print(f"    [dim]{escape(error.details)}[/dim]")
         self._progress.console.print(f"    [dim italic]Hint: {_FAILURE_HINTS[stage]}[/dim italic]")
 
     def done(self, filing: FilingInfo, result: ProcessedFiling) -> None:
@@ -168,7 +172,7 @@ def _run(
     try:
         form_types = parse_form_types(form)
     except ValueError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]{escape(str(e))}[/red]")
         raise typer.Exit(code=1) from None
 
     _validate_date(start_date, "--start-date")
@@ -204,7 +208,7 @@ def _run(
         if not work:
             progress.stop()
             console.print(
-                f"[yellow]No filings found[/yellow] for {', '.join(tickers)} "
+                f"[yellow]No filings found[/yellow] for {escape(', '.join(tickers))} "
                 f"({', '.join(form_types)}) with the given filters."
             )
             return IngestSummary(), reporter.listing_failures
@@ -223,7 +227,7 @@ def _run(
     if summary.limit_error is not None:
         console.print(
             f"[yellow]Filing limit reached[/yellow] after {summary.succeeded} "
-            f"ingestion(s) — stopping. {summary.limit_error.message}"
+            f"ingestion(s) — stopping. {escape(summary.limit_error.message)}"
         )
         console.print(
             "  [dim italic]Hint: Remove filings with 'sec-search manage remove' or raise "
