@@ -4,8 +4,7 @@
 # Two triggers:
 #
 #   1. `workflow_dispatch`  — manual deploy from the Actions tab.
-#        Inputs: environment (defaults to `production`), whether to
-#        skip the test gate (defaults to false).
+#        Input: environment (defaults to `production`).
 #
 #   2. `push` of a `v*` tag  — tagged releases deploy automatically
 #        (e.g. `git tag v0.2.0 && git push origin v0.2.0`).
@@ -16,9 +15,13 @@
 # tag ("Use workflow from" → Tags); dispatched from a branch it fails at
 # the first Google authentication step.
 #
+# Nothing skips the CI gate. Who may deploy is set in GitHub, not here:
+# scripts/github-protect-deploy.sh restricts creating, moving and deleting
+# v* tags to repository admins, and makes the `production` environment
+# accept v* tags only and wait for a required reviewer.
+#
 # The workflow:
-#   1. Waits for the CI workflow to succeed on the same SHA (unless
-#      `skip_ci_check` is true).
+#   1. Waits for the CI workflow to succeed on the same SHA.
 #   2. Authenticates to GCP via Workload Identity Federation — no
 #      long-lived JSON service account keys live in GitHub secrets.
 #   3. Builds both container images via `gcloud builds submit`, which
@@ -64,11 +67,6 @@ on:
         type: choice
         options:
           - production
-      skip_ci_check:
-        description: "Skip waiting for CI to succeed"
-        required: false
-        default: false
-        type: boolean
   push:
     tags:
       - "v*"
@@ -87,7 +85,6 @@ permissions:
 jobs:
   # ────────────────────────────────────────────────────────────────────
   # Gate: block deploy until CI has succeeded on the same commit.
-  # Skipped when triggered manually with `skip_ci_check=true`.
   #
   # Polls the Checks API with the runner's preinstalled gh CLI rather than
   # a third-party action: a composite action can fetch its own
@@ -99,7 +96,6 @@ jobs:
   await-ci:
     name: Await CI success
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' || inputs.skip_ci_check != true }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -149,8 +145,6 @@ jobs:
     name: Build & push images
     runs-on: ubuntu-latest
     needs: [await-ci]
-    # Run the build step even when the CI gate was skipped.
-    if: ${{ always() && (needs.await-ci.result == 'success' || needs.await-ci.result == 'skipped') }}
     timeout-minutes: 60
     permissions:
       contents: read

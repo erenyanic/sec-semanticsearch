@@ -13,7 +13,9 @@ is caught here before the change reaches a pull request.
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -312,6 +314,12 @@ class TestDeployWorkflowTriggers:
         inputs = on["workflow_dispatch"]["inputs"]
         assert "environment" in inputs
 
+    def test_dispatch_cannot_skip_the_ci_gate(self, deploy_workflow):
+        """A manual run must not deploy untested code (security audit 2026-09-16)."""
+        inputs = _workflow_on(deploy_workflow)["workflow_dispatch"]["inputs"]
+        assert set(inputs) == {"environment"}
+        assert "skip_ci_check" not in DEPLOY_WORKFLOW.read_text()
+
 
 class TestDeployWorkflowSecurity:
     """Deploy must use WIF, least privilege, and avoid hardcoded secrets."""
@@ -456,6 +464,12 @@ class TestDeployWorkflowJobs:
     def test_build_job_depends_on_await_ci(self, deploy_workflow):
         build = deploy_workflow["jobs"]["build"]
         assert "await-ci" in build.get("needs", [])
+
+    def test_ci_gate_always_runs_and_blocks(self, deploy_workflow):
+        """No condition may skip the gate or let the build run past a failed one."""
+        jobs = deploy_workflow["jobs"]
+        assert "if" not in jobs["await-ci"]
+        assert "if" not in jobs["build"]
 
     def test_deploy_job_depends_on_build(self, deploy_workflow):
         deploy = deploy_workflow["jobs"]["deploy"]
@@ -677,3 +691,136 @@ class TestWorkflowConsistency:
         assert any(float(str(v)) >= 3.12 for v in ci_python), (
             f"CI Python versions {ci_python} must include >=3.12"
         )
+
+
+# ── GitHub-side deploy protection ────────────────────────────────────
+
+_GH_STUB = """#!/usr/bin/env bash
+# Records each call (arguments separated by 0x1f) and every --input body.
+{ printf '%s\\x1f' "$@"; printf '\\n'; } >> "$GH_LOG"
+for arg in "$@"; do
+    if [ "$arg" = "--input" ]; then { cat; printf '\\n\\x1e\\n'; } >> "$GH_BODIES"; fi
+done
+case "$*" in
+    "api user --jq .login") echo the-owner ;;
+    "api users/"*) echo "${STUB_USER_ID:-4242}" ;;
+    "api --paginate repos/"*"/rulesets --jq"*) printf '%s\\n' ${STUB_RULESET_ID:-} ;;
+    "api --paginate repos/"*"/deployment-branch-policies --jq"*) printf '%s\\n' "${STUB_POLICIES:-}" ;;
+esac
+exit 0
+"""
+
+
+class TestDeployProtectionScript:
+    """scripts/github-protect-deploy.sh, run against a stub gh.
+
+    Security audit 2026-09-16: any collaborator with write access could
+    deploy with a v* tag push.
+    """
+
+    SCRIPT = PROJECT_ROOT / "scripts" / "github-protect-deploy.sh"
+
+    def _run(self, tmp_path, **env_overrides):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "gh"
+        stub.write_text(_GH_STUB)
+        stub.chmod(0o755)
+        log, bodies = tmp_path / "gh.log", tmp_path / "gh.bodies"
+        log.write_text("")
+        bodies.write_text("")
+        env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "GH_LOG": str(log),
+            "GH_BODIES": str(bodies),
+            "GITHUB_REPOSITORY": "Owner/Repo",
+        }
+        env.update(env_overrides)
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT)], env=env, capture_output=True, text=True, timeout=30
+        )
+        calls = [line.split("\x1f")[:-1] for line in log.read_text().splitlines()]
+        writes = [c for c in calls if "--input" in c]
+        payloads = [json.loads(b) for b in bodies.read_text().split("\n\x1e\n") if b.strip()]
+        return result, calls, list(zip(writes, payloads, strict=True))
+
+    @staticmethod
+    def _write(writes, method: str, path: str):
+        (payload,) = [p for call, p in writes if call[1:4] == ["--method", method, path]]
+        return payload
+
+    def test_script_is_executable(self):
+        assert self.SCRIPT.stat().st_mode & 0o111
+
+    def test_succeeds_against_stub(self, tmp_path):
+        result, _, _ = self._run(tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_only_admins_may_create_move_or_delete_release_tags(self, tmp_path):
+        _, _, writes = self._run(tmp_path)
+        ruleset = self._write(writes, "POST", "repos/Owner/Repo/rulesets")
+        assert ruleset["target"] == "tag"
+        assert ruleset["enforcement"] == "active"
+        assert ruleset["conditions"]["ref_name"]["include"] == ["refs/tags/v*"]
+        assert {r["type"] for r in ruleset["rules"]} == {"creation", "update", "deletion"}
+        assert ruleset["bypass_actors"] == [
+            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+        ]
+
+    def test_existing_ruleset_is_updated_in_place(self, tmp_path):
+        _, calls, writes = self._run(tmp_path, STUB_RULESET_ID="77")
+        assert self._write(writes, "PUT", "repos/Owner/Repo/rulesets/77")["target"] == "tag"
+        assert ["api", "--method", "POST", "repos/Owner/Repo/rulesets"] not in [
+            c[:4] for c in calls
+        ]
+
+    def test_production_requires_review_admins_cannot_bypass(self, tmp_path):
+        _, _, writes = self._run(tmp_path)
+        env = self._write(writes, "PUT", "repos/Owner/Repo/environments/production")
+        assert env["reviewers"] == [{"type": "User", "id": 4242}]
+        assert env["can_admins_bypass"] is False
+        assert env["deployment_branch_policy"] == {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        }
+
+    def test_default_reviewer_is_the_authenticated_user(self, tmp_path):
+        _, calls, _ = self._run(tmp_path)
+        assert ["api", "user", "--jq", ".login"] in calls
+        assert ["api", "users/the-owner", "--jq", ".id"] in calls
+
+    def test_named_reviewers(self, tmp_path):
+        _, calls, writes = self._run(tmp_path, DEPLOY_REVIEWERS="alice,bob-2")
+        assert ["api", "user", "--jq", ".login"] not in calls
+        env = self._write(writes, "PUT", "repos/Owner/Repo/environments/production")
+        assert len(env["reviewers"]) == 2
+
+    def test_adds_tag_deployment_policy(self, tmp_path):
+        _, calls, _ = self._run(tmp_path)
+        (policy,) = [c for c in calls if c[-4:] == ["-f", "name=v*", "-f", "type=tag"]]
+        assert policy[3] == "repos/Owner/Repo/environments/production/deployment-branch-policies"
+
+    def test_existing_tag_policy_not_duplicated(self, tmp_path):
+        result, calls, _ = self._run(tmp_path, STUB_POLICIES="tag v*")
+        assert not [c for c in calls if "type=tag" in c]
+        assert "WARNING" not in result.stdout
+
+    def test_warns_about_other_deployment_sources(self, tmp_path):
+        result, _, _ = self._run(tmp_path, STUB_POLICIES="tag v*\nbranch main")
+        assert "WARNING" in result.stdout
+        assert "  - branch main" in result.stdout
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"GITHUB_REPOSITORY": 'Owner/Repo" || true'},
+            {"DEPLOY_REVIEWERS": 'alice,"bob"'},
+            {"DEPLOY_REVIEWERS": "a,b,c,d,e,f,g"},
+        ],
+    )
+    def test_rejects_unsafe_input_before_writing(self, tmp_path, env):
+        """Values reach JSON bodies and API paths; nothing is written if one is malformed."""
+        result, calls, writes = self._run(tmp_path, **env)
+        assert result.returncode != 0
+        assert writes == []
+        assert not [c for c in calls if "--method" in c]
