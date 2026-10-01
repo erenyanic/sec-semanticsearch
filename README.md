@@ -104,21 +104,22 @@ The SEC requires a name and email in the User-Agent header of every EDGAR reques
 
 **Commonly used optional variables:**
 
-| Variable               | Default                      | Description                                       |
-| ---------------------- | ---------------------------- | ------------------------------------------------- |
-| `HUGGING_FACE_TOKEN`   | —                            | HF token; the default model is gated              |
-| `EMBEDDING_MODEL_NAME` | `google/embeddinggemma-300m` | Sentence-transformer model                        |
-| `EMBEDDING_DEVICE`     | `auto`                       | `cuda`, `cpu`, or `auto`                          |
-| `EMBEDDING_BATCH_SIZE` | `32`                         | Reduce for low-VRAM GPUs (e.g. `8`)               |
-| `DB_CHROMA_PATH`       | `./data/chroma_db`           | ChromaDB storage path                             |
-| `DB_METADATA_DB_PATH`  | `./data/metadata.sqlite`     | SQLite metadata path                              |
-| `DB_ENCRYPTION_KEY`    | unset                        | SQLCipher key; unset = plain SQLite               |
-| `DB_MAX_FILINGS`       | `2500`                       | Maximum filings to store                          |
-| `SEARCH_TOP_K`         | `5`                          | Default number of search results                  |
-| `API_KEY`              | unset                        | General API access key; unset = no authentication |
-| `API_ADMIN_KEY`        | unset                        | Admin key for destructive operations              |
-| `LOG_REDACT_QUERIES`   | `false`                      | Hash search queries and tickers in logs           |
-| `API_DEMO_MODE`        | `false`                      | FIFO eviction + temporary-data notice             |
+| Variable                 | Default                      | Description                                       |
+| ------------------------ | ---------------------------- | ------------------------------------------------- |
+| `HUGGING_FACE_TOKEN`     | —                            | HF token; the default model is gated              |
+| `EMBEDDING_MODEL_NAME`   | `google/embeddinggemma-300m` | Sentence-transformer model                        |
+| `EMBEDDING_DEVICE`       | `auto`                       | `cuda`, `cpu`, or `auto`                          |
+| `EMBEDDING_BATCH_SIZE`   | `32`                         | Reduce for low-VRAM GPUs (e.g. `8`)               |
+| `DB_CHROMA_PATH`         | `./data/chroma_db`           | ChromaDB storage path                             |
+| `DB_METADATA_DB_PATH`    | `./data/metadata.sqlite`     | SQLite metadata path                              |
+| `DB_ENCRYPTION_KEY`      | unset                        | SQLCipher key; unset = plain SQLite (local only)  |
+| `DB_ENCRYPTION_KEY_FILE` | unset                        | File holding the SQLCipher key (shared servers)   |
+| `DB_MAX_FILINGS`         | `2500`                       | Maximum filings to store                          |
+| `SEARCH_TOP_K`           | `5`                          | Default number of search results                  |
+| `API_KEY`                | unset                        | General API access key; unset = no authentication |
+| `API_ADMIN_KEY`          | unset                        | Admin key for destructive operations              |
+| `LOG_REDACT_QUERIES`     | `false`                      | Hash search queries and tickers in logs           |
+| `API_DEMO_MODE`          | `false`                      | FIFO eviction + temporary-data notice             |
 
 See [`.env.example`](.env.example) for the full variable list with descriptions.
 
@@ -402,7 +403,7 @@ sec-search-api --ssl-certfile cert.pem --ssl-keyfile key.pem
 
 - Set `API_KEY` to a strong random value
 - Set `API_ADMIN_KEY` separately for destructive operations. When running the web stack, set the frontend's `ADMIN_API_KEY` to the same value — Next.js route handlers read it server-side and forward it to the API as `X-Admin-Key`, so it never reaches browser code
-- Set `DB_ENCRYPTION_KEY` to enable SQLCipher encryption on the SQLite database
+- Set `DB_ENCRYPTION_KEY_FILE` to a file holding the key (a Docker secret or a Secret Manager volume) to enable SQLCipher encryption on the SQLite database. Do not use `DB_ENCRYPTION_KEY` here: any process running as the same user can read environment variables from `/proc/<pid>/environ`
 - Set `LOG_REDACT_QUERIES=true` to hash search queries and tickers in logs
 - Set rate limits via `API_RATE_LIMIT_*` environment variables
 

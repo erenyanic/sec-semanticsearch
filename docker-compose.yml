@@ -62,8 +62,8 @@ services:
       - DB_MAX_FILINGS=${DB_MAX_FILINGS:-500}
       - DB_ENCRYPTION_KEY=${DB_ENCRYPTION_KEY:-}
       # ── Docker secrets alternative (recommended for production) ────────
-      # Using Docker secrets prevents the key from appearing in
-      # /proc/<pid>/environ (see SECURITY VULNERABILITIES.md §F5).
+      # Using Docker secrets keeps the key out of /proc/<pid>/environ,
+      # where any process running as the same user can read it.
       #
       # Step 1 — Create the secret:
       #   echo "your-strong-key" | docker secret create db_encryption_key -
@@ -166,7 +166,8 @@ volumes:
     driver: local
 
 # ── Secrets (optional) ───────────────────────────────────────────────
-# Uncomment to use Docker secrets for DB_ENCRYPTION_KEY (see F5 mitigation).
+# Uncomment to read the SQLCipher key from a Docker secret
+# (DB_ENCRYPTION_KEY_FILE) instead of the DB_ENCRYPTION_KEY variable.
 # secrets:
 #   db_encryption_key:
 #     file: ./secrets/db_encryption_key.txt   # local compose

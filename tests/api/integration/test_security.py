@@ -1458,6 +1458,24 @@ class TestHttpsEnforcement:
         assert "HTTPS" in content
         assert "ssl-certfile" in content
 
+    def test_readme_public_settings_use_the_key_file(self):
+        """Public deployments must read the SQLCipher key from a file.
+
+        ``DB_ENCRYPTION_KEY`` is visible in ``/proc/<pid>/environ``; the
+        README's public-deployment list recommended it (audit 2026-09-16).
+        """
+        readme = (Path(__file__).parents[3] / "README.md").read_text()
+        public = readme.split("**Recommended settings for public deployments:**", 1)[1]
+        public = public.split("\n---", 1)[0]
+        assert "Set `DB_ENCRYPTION_KEY_FILE`" in public
+        assert "Set `DB_ENCRYPTION_KEY` " not in public
+
+    def test_compose_cites_no_missing_finding(self):
+        """docker-compose.yml cited a "§F5" that no document contains."""
+        compose = (Path(__file__).parents[3] / "docker-compose.yml").read_text()
+        assert "§F5" not in compose
+        assert "F5 mitigation" not in compose
+
     def test_run_module_docstring_mentions_tls(self):
         """The run module docstring must mention TLS/HTTPS."""
         from sec_semantic_search.api import run
