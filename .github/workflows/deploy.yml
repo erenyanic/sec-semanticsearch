@@ -10,6 +10,12 @@
 #   2. `push` of a `v*` tag  — tagged releases deploy automatically
 #        (e.g. `git tag v0.2.0 && git push origin v0.2.0`).
 #
+# Google credentials are issued only to this workflow running at a v* tag:
+# the Workload Identity provider created by scripts/gcloud-setup-deployer.sh
+# rejects every other workflow file and ref. Run a manual deploy against a
+# tag ("Use workflow from" → Tags); dispatched from a branch it fails at
+# the first Google authentication step.
+#
 # The workflow:
 #   1. Waits for the CI workflow to succeed on the same SHA (unless
 #      `skip_ci_check` is true).
@@ -22,15 +28,19 @@
 #      YAML manifests — single source of truth for placeholder
 #      substitution.
 #
+# Permissions are granted per job. Only the three jobs that authenticate
+# to Google hold `id-token: write`; any code running in a job with it can
+# mint a GitHub OIDC token for this repository.
+#
 # Required repository secrets:
 #   - GCP_WORKLOAD_IDENTITY_PROVIDER
 #       projects/NUMBER/locations/global/workloadIdentityPools/POOL/
 #       providers/PROVIDER
 #   - GCP_SERVICE_ACCOUNT
 #       sec-search-deployer@PROJECT_ID.iam.gserviceaccount.com
-#       (must hold roles: run.admin, iam.serviceAccountUser,
-#        artifactregistry.writer, cloudbuild.builds.editor,
-#        storage.admin, secretmanager.admin)
+#       Both are created by scripts/gcloud-setup-deployer.sh, which also
+#       grants the deployer its roles (no Secret Manager role, no
+#       project-wide storage role).
 #   - GCP_PROJECT_ID
 #   - GCP_REGION (e.g. us-central1)
 #
@@ -69,49 +79,68 @@ concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
+# Workflow default: read the repository, nothing else. Jobs that need
+# more declare it themselves.
 permissions:
   contents: read
-  # Required by google-github-actions/auth@v2 for Workload Identity
-  # Federation (OIDC token exchange).
-  id-token: write
 
 jobs:
   # ────────────────────────────────────────────────────────────────────
   # Gate: block deploy until CI has succeeded on the same commit.
   # Skipped when triggered manually with `skip_ci_check=true`.
+  #
+  # Polls the Checks API with the runner's preinstalled gh CLI rather than
+  # a third-party action: a composite action can fetch its own
+  # dependencies by mutable tag at run time, which a SHA pin does not
+  # freeze. Only check runs created by the GitHub Actions app (id 15368)
+  # count, so another installed app cannot satisfy the gate with a check
+  # of the same name.
   # ────────────────────────────────────────────────────────────────────
   await-ci:
     name: Await CI success
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'push' || inputs.skip_ci_check != true }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: read
     steps:
-      - name: Wait for backend tests
-        uses: lewagon/wait-on-check-action@ccfb013c15c8afb7bf2b7c028fb74dc5a068cccc # v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: "Backend tests (Python 3.12)"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-          allowed-conclusions: success
-
-      - name: Wait for frontend tests
-        uses: lewagon/wait-on-check-action@ccfb013c15c8afb7bf2b7c028fb74dc5a068cccc # v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: "Frontend tests (Node 22)"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-          allowed-conclusions: success
-
-      - name: Wait for lint
-        uses: lewagon/wait-on-check-action@ccfb013c15c8afb7bf2b7c028fb74dc5a068cccc # v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: "Ruff lint & format check"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-          allowed-conclusions: success
+      - name: Wait for CI checks on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          checks=(
+            "Backend tests (Python 3.12)"
+            "Frontend tests (Node 22)"
+            "Ruff lint & format check"
+          )
+          while true; do
+            pending=0
+            for name in "${checks[@]}"; do
+              # filter=latest: a re-run replaces the earlier result.
+              state=$(gh api --method GET "repos/${REPO}/commits/${SHA}/check-runs" \
+                -f check_name="$name" -f filter=latest -f app_id=15368 \
+                --jq '.check_runs[0] | if . == null then "missing" else "\(.status) \(.conclusion)" end')
+              case "$state" in
+                "completed success") ;;
+                completed*)
+                  echo "::error::${name} concluded '${state#completed }' on ${SHA}"
+                  exit 1
+                  ;;
+                *)
+                  pending=1
+                  echo "Waiting for ${name} (${state})"
+                  ;;
+              esac
+            done
+            if [ "$pending" -eq 0 ]; then
+              break
+            fi
+            sleep 20
+          done
+          echo "All CI checks passed on ${SHA}."
 
   # ────────────────────────────────────────────────────────────────────
   # Build: push API (CUDA) + frontend images to Artifact Registry.
@@ -123,6 +152,9 @@ jobs:
     # Run the build step even when the CI gate was skipped.
     if: ${{ always() && (needs.await-ci.result == 'success' || needs.await-ci.result == 'skipped') }}
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write  # Workload Identity Federation token exchange
 
     env:
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -291,6 +323,9 @@ jobs:
     environment:
       name: ${{ inputs.environment || 'production' }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write  # Workload Identity Federation token exchange
 
     env:
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -325,6 +360,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [deploy]
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write  # Workload Identity Federation token exchange
 
     env:
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}

@@ -316,21 +316,85 @@ class TestDeployWorkflowTriggers:
 class TestDeployWorkflowSecurity:
     """Deploy must use WIF, least privilege, and avoid hardcoded secrets."""
 
-    def test_has_id_token_write_for_wif(self, deploy_workflow):
-        """Workload Identity Federation requires id-token: write."""
-        perms = deploy_workflow.get("permissions", {})
-        assert perms.get("id-token") == "write"
+    @staticmethod
+    def _authenticating_jobs(workflow: dict) -> set[str]:
+        return {
+            name
+            for name, job in workflow["jobs"].items()
+            if any(
+                step.get("uses", "").startswith("google-github-actions/auth")
+                for step in job.get("steps", [])
+            )
+        }
 
-    def test_contents_read_only(self, deploy_workflow):
-        perms = deploy_workflow.get("permissions", {})
-        assert perms.get("contents") == "read"
+    def test_workflow_default_is_read_only(self, deploy_workflow):
+        """No job may inherit id-token: write from the workflow level.
 
-    def test_no_broader_permissions(self, deploy_workflow):
-        """Deploy must only hold id-token and contents — nothing else."""
-        perms = deploy_workflow.get("permissions", {})
-        assert set(perms.keys()) <= {"contents", "id-token"}, (
-            f"Unexpected workflow permissions: {perms}"
-        )
+        Any code that runs in a job holding id-token: write can mint a
+        GitHub OIDC token for this repository (security audit 2026-09-16).
+        """
+        assert deploy_workflow.get("permissions") == {"contents": "read"}
+
+    def test_every_job_declares_permissions(self, deploy_workflow):
+        for name, job in deploy_workflow["jobs"].items():
+            assert "permissions" in job, f"deploy job {name!r} must declare its permissions"
+
+    def test_id_token_only_where_google_auth_runs(self, deploy_workflow):
+        """id-token: write exactly on the jobs that exchange it for Google credentials."""
+        with_id_token = {
+            name
+            for name, job in deploy_workflow["jobs"].items()
+            if job.get("permissions", {}).get("id-token") == "write"
+        }
+        assert with_id_token == self._authenticating_jobs(deploy_workflow)
+        assert with_id_token == {"build", "deploy", "smoke-test"}
+
+    def test_no_job_writes_to_the_repository(self, deploy_workflow):
+        """id-token is the only write permission any deploy job holds."""
+        for name, job in deploy_workflow["jobs"].items():
+            for scope, level in job["permissions"].items():
+                assert level == "read" or scope == "id-token", (
+                    f"deploy job {name!r} holds {scope}: {level}"
+                )
+
+    def test_ci_gate_reads_checks_only(self, deploy_workflow):
+        assert deploy_workflow["jobs"]["await-ci"]["permissions"] == {
+            "contents": "read",
+            "checks": "read",
+        }
+
+    def test_ci_gate_runs_no_action_code(self, deploy_workflow):
+        """The gate must not run an action whose dependencies a SHA pin cannot freeze.
+
+        lewagon/wait-on-check-action is a composite action that installed
+        ruby/setup-ruby and actions/cache by mutable tag and ran
+        ``bundle install`` at job time.
+        """
+        steps = deploy_workflow["jobs"]["await-ci"]["steps"]
+        assert all("uses" not in step for step in steps)
+        assert "lewagon/" not in DEPLOY_WORKFLOW.read_text()
+
+    def test_ci_gate_waits_for_every_ci_job(self, deploy_workflow, ci_workflow):
+        """Each CI job's rendered check name must be in the gate's list."""
+        gate = deploy_workflow["jobs"]["await-ci"]["steps"][0]["run"]
+        for job in ci_workflow["jobs"].values():
+            name = job["name"]
+            for key, values in job.get("strategy", {}).get("matrix", {}).items():
+                name = name.replace(f"${{{{ matrix.{key} }}}}", str(values[0]))
+            assert f'"{name}"' in gate, f"deploy gate does not wait for {name!r}"
+
+    def test_ci_gate_counts_github_actions_checks_only(self, deploy_workflow):
+        """A check of the same name from another installed app must not pass the gate."""
+        gate = deploy_workflow["jobs"]["await-ci"]["steps"][0]["run"]
+        assert "app_id=15368" in gate
+        assert "filter=latest" in gate
+        assert '"completed success"' in gate
+
+    def test_ci_gate_reads_context_through_env(self, deploy_workflow):
+        step = deploy_workflow["jobs"]["await-ci"]["steps"][0]
+        assert "${{" not in step["run"]
+        assert step["env"]["SHA"] == "${{ github.sha }}"
+        assert step["env"]["REPO"] == "${{ github.repository }}"
 
     def test_uses_workload_identity_federation(self, deploy_workflow):
         """google-github-actions/auth must be called with WIF, not a JSON key."""

@@ -413,6 +413,7 @@ class TestShellScripts:
             "scripts/gcloud-deploy.sh",
             "scripts/gcloud-setup-secrets.sh",
             "scripts/demo-reset.sh",
+            "scripts/gcloud-setup-deployer.sh",
         ]
     )
     def script_path(self, request):
@@ -443,3 +444,202 @@ class TestShellScripts:
         assert "set -e" in content or "set -eu" in content, (
             f"{script_path.name} does not use strict error handling"
         )
+
+
+# ── GitHub deployer setup (Workload Identity + least privilege) ──────
+
+_GCLOUD_STUB = """#!/usr/bin/env bash
+# Records each call (arguments separated by 0x1f) and answers the reads
+# the script makes. Every other call succeeds without output.
+{ printf '%s\\x1f' "$@"; printf '\\n'; } >> "$GCLOUD_LOG"
+case "$1 $2" in
+    "projects describe") echo 123456789; exit 0 ;;
+    "projects get-iam-policy") printf '%s\\n' ${STUB_DEPLOYER_ROLES:-}; exit 0 ;;
+    "storage buckets") [ "$3" = list ] && printf '%s\\n' ${STUB_BUCKETS:-}; exit 0 ;;
+esac
+for arg in "$@"; do
+    [ "$arg" = describe ] && exit "${STUB_DESCRIBE_EXIT:-1}"
+done
+exit 0
+"""
+
+
+class TestDeployerSetup:
+    """scripts/gcloud-setup-deployer.sh, run against a stub gcloud.
+
+    Security audit 2026-09-16: the deployer held secretmanager.admin and
+    project-wide storage.admin, and nothing restricted which workflow could
+    exchange a GitHub OIDC token for it.
+    """
+
+    SCRIPT = SCRIPTS_DIR / "gcloud-setup-deployer.sh"
+    REPO = "Owner/Repo"
+    DEPLOYER = "serviceAccount:sec-search-deployer@test-proj.iam.gserviceaccount.com"
+
+    def _run(self, tmp_path, **env_overrides) -> tuple[subprocess.CompletedProcess, list]:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        stub = bin_dir / "gcloud"
+        stub.write_text(_GCLOUD_STUB)
+        stub.chmod(0o755)
+        log = tmp_path / "gcloud.log"
+        log.write_text("")
+        env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "GCLOUD_LOG": str(log),
+            "PROJECT_ID": "test-proj",
+            "REGION": "europe-west1",
+            "GITHUB_REPOSITORY": self.REPO,
+        }
+        env.update(env_overrides)
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT)], env=env, capture_output=True, text=True, timeout=30
+        )
+        calls = [line.split("\x1f")[:-1] for line in log.read_text().splitlines()]
+        return result, calls
+
+    @staticmethod
+    def _calls(calls: list, *prefix: str) -> list[list[str]]:
+        return [c for c in calls if c[: len(prefix)] == list(prefix)]
+
+    @staticmethod
+    def _flag(call: list[str], name: str) -> str:
+        values = [a.split("=", 1)[1] for a in call if a.startswith(f"{name}=")]
+        assert len(values) == 1, f"{name} not passed exactly once: {call}"
+        return values[0]
+
+    def test_succeeds_against_stub(self, tmp_path):
+        result, _ = self._run(tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_condition_pins_repository_deploy_workflow_and_tags(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        (create,) = self._calls(calls, "iam", "workload-identity-pools", "providers", "create-oidc")
+        assert self._flag(create, "--attribute-condition") == (
+            "assertion.repository == 'Owner/Repo' && "
+            "assertion.workflow_ref.startsWith("
+            "'Owner/Repo/.github/workflows/deploy.yml@refs/tags/v')"
+        )
+        assert self._flag(create, "--issuer-uri") == "https://token.actions.githubusercontent.com"
+
+    def test_existing_provider_gets_the_condition(self, tmp_path):
+        """Re-running on an older, unconditioned provider must apply the condition."""
+        _, calls = self._run(tmp_path, STUB_DESCRIBE_EXIT="0")
+        assert not self._calls(calls, "iam", "workload-identity-pools", "providers", "create-oidc")
+        (update,) = self._calls(calls, "iam", "workload-identity-pools", "providers", "update-oidc")
+        assert "deploy.yml@refs/tags/v" in self._flag(update, "--attribute-condition")
+
+    @pytest.mark.parametrize(
+        "repository",
+        ["Owner/Repo' || true || '", "Owner", "Owner/Repo/extra", "Owner/Re po"],
+    )
+    def test_rejects_malformed_repository_before_any_call(self, tmp_path, repository):
+        """The repository is written into a CEL expression; quotes must never reach it."""
+        result, calls = self._run(tmp_path, GITHUB_REPOSITORY=repository)
+        assert result.returncode != 0
+        assert calls == []
+
+    def test_only_this_repository_may_impersonate(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        (binding,) = [
+            c
+            for c in self._calls(calls, "iam", "service-accounts", "add-iam-policy-binding")
+            if "--role=roles/iam.workloadIdentityUser" in c
+        ]
+        assert binding[3] == "sec-search-deployer@test-proj.iam.gserviceaccount.com"
+        assert self._flag(binding, "--member") == (
+            "principalSet://iam.googleapis.com/projects/123456789/locations/global/"
+            "workloadIdentityPools/github/attribute.repository/Owner/Repo"
+        )
+
+    def test_project_roles_are_minimal(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        granted = {
+            self._flag(c, "--role")
+            for c in self._calls(calls, "projects", "add-iam-policy-binding")
+        }
+        assert granted == {
+            "roles/run.admin",
+            "roles/cloudbuild.builds.editor",
+            "roles/serviceusage.serviceUsageConsumer",
+            "roles/storage.bucketViewer",
+        }
+
+    def test_never_grants_secret_manager_or_storage_admin(self, tmp_path):
+        """Secrets are created out of band; the deployer reads none of them."""
+        _, calls = self._run(tmp_path)
+        roles = [self._flag(c, "--role") for c in calls if "add-iam-policy-binding" in c]
+        assert not [r for r in roles if r.startswith("roles/secretmanager.")]
+        assert "roles/storage.admin" not in roles
+
+    def test_removes_broad_roles_from_earlier_setups(self, tmp_path):
+        _, calls = self._run(
+            tmp_path,
+            STUB_DEPLOYER_ROLES="roles/storage.admin roles/secretmanager.admin "
+            "roles/iam.serviceAccountUser roles/run.admin",
+        )
+        removed = {
+            self._flag(c, "--role")
+            for c in self._calls(calls, "projects", "remove-iam-policy-binding")
+        }
+        assert removed == {
+            "roles/storage.admin",
+            "roles/secretmanager.admin",
+            "roles/iam.serviceAccountUser",
+        }
+        for call in self._calls(calls, "projects", "remove-iam-policy-binding"):
+            assert self._flag(call, "--member") == self.DEPLOYER
+            assert "--all" in call
+
+    def test_nothing_removed_when_already_minimal(self, tmp_path):
+        _, calls = self._run(tmp_path, STUB_DEPLOYER_ROLES="roles/run.admin")
+        assert not self._calls(calls, "projects", "remove-iam-policy-binding")
+
+    def test_storage_access_is_the_staging_bucket_only(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        (grant,) = self._calls(calls, "storage", "buckets", "add-iam-policy-binding")
+        assert grant[3] == "gs://test-proj_cloudbuild"
+        assert self._flag(grant, "--role") == "roles/storage.objectAdmin"
+        assert self._flag(grant, "--member") == self.DEPLOYER
+
+    def test_creates_missing_staging_bucket_in_the_project(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        (create,) = self._calls(calls, "storage", "buckets", "create")
+        assert create[3] == "gs://test-proj_cloudbuild"
+        assert self._flag(create, "--project") == "test-proj"
+
+    def test_existing_staging_bucket_not_recreated(self, tmp_path):
+        _, calls = self._run(tmp_path, STUB_BUCKETS="other test-proj_cloudbuild")
+        assert not self._calls(calls, "storage", "buckets", "create")
+
+    def test_staging_bucket_name_matches_gcloud(self, tmp_path):
+        """Same transformation as gcloud's GetDefaultStagingBucket()."""
+        _, calls = self._run(tmp_path, PROJECT_ID="google.com:my-proj")
+        (grant,) = self._calls(calls, "storage", "buckets", "add-iam-policy-binding")
+        assert grant[3] == "gs://elgoog_com_my-proj_cloudbuild"
+
+    def test_artifact_registry_access_is_the_repository_only(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        (grant,) = self._calls(calls, "artifacts", "repositories", "add-iam-policy-binding")
+        assert grant[3] == "sec-search"
+        assert self._flag(grant, "--role") == "roles/artifactregistry.writer"
+        assert self._flag(grant, "--location") == "europe-west1"
+
+    def test_act_as_is_granted_per_account(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        act_as = [
+            c[3]
+            for c in self._calls(calls, "iam", "service-accounts", "add-iam-policy-binding")
+            if "--role=roles/iam.serviceAccountUser" in c
+        ]
+        assert "sec-search-sa@test-proj.iam.gserviceaccount.com" in act_as
+
+    def test_prints_repository_secret_values(self, tmp_path):
+        result, _ = self._run(tmp_path)
+        assert (
+            "GCP_WORKLOAD_IDENTITY_PROVIDER = projects/123456789/locations/global/"
+            "workloadIdentityPools/github/providers/sec-search-deploy"
+        ) in result.stdout
+        assert (
+            "GCP_SERVICE_ACCOUNT            = sec-search-deployer@test-proj.iam.gserviceaccount.com"
+        ) in result.stdout
