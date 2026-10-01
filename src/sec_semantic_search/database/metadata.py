@@ -20,7 +20,6 @@ Usage:
 """
 
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -62,27 +61,6 @@ def _get_sqlite_module(encryption_key: str | None) -> types.ModuleType:
                 "Falling back to unencrypted sqlite3."
             )
     return sqlite3
-
-
-def _resolve_runtime_encryption_key(default_key: str | None) -> str | None:
-    """Resolve the current SQLCipher key from env vars without revalidating paths.
-
-    MetadataRegistry supports tests that override database paths with temporary
-    directories outside the project root. Re-instantiating DatabaseSettings()
-    would re-run path validation and fail those tests. For the registry we only
-    need the encryption key fields, so resolve them directly from the current
-    process environment and fall back to the already-loaded settings value.
-    """
-    from sec_semantic_search.config.settings import resolve_encryption_key_from_values
-
-    env_key = os.environ.get("DB_ENCRYPTION_KEY")
-    env_key_file = os.environ.get("DB_ENCRYPTION_KEY_FILE")
-
-    # If either env var is set, resolve from them (ignoring default_key).
-    if env_key or env_key_file:
-        return resolve_encryption_key_from_values(env_key, env_key_file)
-
-    return default_key
 
 
 # SEC accession number pattern: NNNNNNNNNN-NN-NNNNNN (with or without dashes).
@@ -232,23 +210,26 @@ class MetadataRegistry:
         connections — so a search's parent lookup no longer waits for an
         ingest's segment inserts.
 
-        When *encryption_key* is provided (or ``DB_ENCRYPTION_KEY`` is set),
-        both connections use ``pysqlcipher3`` and issue ``PRAGMA key``
+        When *encryption_key* is provided (or settings resolved one from
+        ``DB_ENCRYPTION_KEY`` or ``DB_ENCRYPTION_KEY_FILE``), both
+        connections use ``pysqlcipher3`` and issue ``PRAGMA key``
         immediately after opening.
 
         Args:
             db_path: Path to SQLite database file. If None, uses
                      ``settings.database.metadata_db_path``.
-            encryption_key: SQLCipher encryption key. If None, reads from
-                            ``settings.database.encryption_key``.
+            encryption_key: SQLCipher encryption key. If None, uses
+                            ``settings.database.encryption_key`` — the key
+                            ``DatabaseSettings`` validated at start-up. The
+                            environment is not read again here, so a later
+                            change to it cannot switch the key that opens
+                            the database.
         """
         settings = get_settings()
         self._db_path = db_path or settings.database.metadata_db_path
         self._max_filings = settings.database.max_filings
         self._encryption_key = (
-            encryption_key
-            if encryption_key is not None
-            else _resolve_runtime_encryption_key(settings.database.encryption_key)
+            encryption_key if encryption_key is not None else settings.database.encryption_key
         )
 
         # Ensure parent directory exists

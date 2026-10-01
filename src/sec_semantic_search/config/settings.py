@@ -82,9 +82,8 @@ def resolve_encryption_key_from_values(key: str | None, key_file: str | None) ->
     file when ``key_file`` is used. Returns the resolved key string, or
     ``None`` if neither source is set.
 
-    Used by both ``DatabaseSettings`` (Pydantic validation) and
-    ``MetadataRegistry`` (runtime resolution without re-instantiating
-    settings).
+    Called by ``DatabaseSettings`` only; ``MetadataRegistry`` takes the
+    resolved key from settings, so there is one source of truth.
     """
     if key and key_file:
         raise ValueError(

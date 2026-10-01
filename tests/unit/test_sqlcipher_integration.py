@@ -118,12 +118,15 @@ class _FakeSqlCipherConnection:
     does not understand).
     """
 
-    def __init__(self, real_conn: sqlite3.Connection) -> None:
+    def __init__(self, real_conn: sqlite3.Connection, key_log: list[str] | None = None) -> None:
         # Use object.__setattr__ to avoid triggering our __setattr__
         object.__setattr__(self, "_conn", real_conn)
+        object.__setattr__(self, "_key_log", key_log)
 
     def execute(self, sql: str, *args, **kwargs):
         if isinstance(sql, str) and sql.strip().upper().startswith("PRAGMA KEY"):
+            if self._key_log is not None:
+                self._key_log.append(sql)
             return self._conn.execute("SELECT 1")
         return self._conn.execute(sql, *args, **kwargs)
 
@@ -132,7 +135,7 @@ class _FakeSqlCipherConnection:
 
     def __setattr__(self, name, value):
         # Delegate attribute writes (e.g. row_factory) to the real connection
-        if name == "_conn":
+        if name in ("_conn", "_key_log"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._conn, name, value)
@@ -144,18 +147,19 @@ class _FakeSqlCipherConnection:
         return self._conn.__exit__(*exc)
 
 
-def _make_fake_sqlcipher_module():
+def _make_fake_sqlcipher_module(key_log: list[str] | None = None):
     """Create a fake pysqlcipher3.dbapi2 module backed by real sqlite3.
 
     Returns connections wrapped in ``_FakeSqlCipherConnection`` so that
     ``PRAGMA key`` is silently accepted.  This lets us test the encrypted
-    code path without the native sqlcipher library.
+    code path without the native sqlcipher library.  When *key_log* is
+    given, every ``PRAGMA key`` statement is appended to it.
     """
     mod = types.ModuleType("pysqlcipher3.dbapi2")
 
     def _fake_connect(*args, **kwargs):
         real_conn = sqlite3.connect(*args, **kwargs)
-        return _FakeSqlCipherConnection(real_conn)
+        return _FakeSqlCipherConnection(real_conn, key_log)
 
     mod.connect = _fake_connect
     mod.Error = sqlite3.Error
@@ -472,7 +476,7 @@ class TestFileBasedKeyLoading:
         4. MetadataRegistry(encryption_key=None) picks it up from settings
         5. Verify MetadataRegistry recognises encryption is enabled
         """
-        from sec_semantic_search.config import DatabaseSettings, reload_settings
+        from sec_semantic_search.config import DatabaseSettings, get_settings
 
         # Create a temporary key file (simulating Docker secrets)
         key_file = tmp_path / "db_encryption_key"
@@ -482,13 +486,14 @@ class TestFileBasedKeyLoading:
         monkeypatch.setenv("DB_ENCRYPTION_KEY_FILE", str(key_file))
         monkeypatch.delenv("DB_ENCRYPTION_KEY", raising=False)
 
-        # Reload settings to pick up the new env vars
-        reload_settings()
-
         # Verify that DatabaseSettings resolved the key from the file
         settings = DatabaseSettings()
         assert settings.encryption_key == "file-based-secret-key"
         assert settings.encryption_key_file == str(key_file)
+
+        # In a process started with that environment, these are the
+        # settings the singleton holds (resolved once, at import).
+        monkeypatch.setattr(get_settings(), "database", settings)
 
         # Create MetadataRegistry with encryption_key=None (use settings)
         with patch(
@@ -504,3 +509,103 @@ class TestFileBasedKeyLoading:
         # (This proves the key was loaded from the file and encryption is active)
         assert registry.encrypted is True
         registry.close()
+
+
+# ---------------------------------------------------------------------------
+# One source of truth for the key (security audit 2026-09-16, observation)
+# ---------------------------------------------------------------------------
+
+
+class TestKeyComesFromSettingsOnly:
+    """The registry opens the database with the key settings validated at start-up.
+
+    It used to re-read ``DB_ENCRYPTION_KEY`` / ``DB_ENCRYPTION_KEY_FILE``
+    from ``os.environ`` on every construction, so a later change to the
+    environment switched the key without the settings singleton noticing.
+    """
+
+    @staticmethod
+    def _start_process_with(monkeypatch, key: str | None) -> None:
+        """Give the settings singleton the database settings a process started
+        with *key* in its environment resolves at import (AD#6)."""
+        from sec_semantic_search.config import DatabaseSettings, get_settings
+
+        monkeypatch.delenv("DB_ENCRYPTION_KEY_FILE", raising=False)
+        if key is None:
+            monkeypatch.delenv("DB_ENCRYPTION_KEY", raising=False)
+        else:
+            monkeypatch.setenv("DB_ENCRYPTION_KEY", key)
+        monkeypatch.setattr(get_settings(), "database", DatabaseSettings())
+
+    @pytest.fixture
+    def settings_with_key(self, monkeypatch):
+        self._start_process_with(monkeypatch, "settings-key")
+
+    @pytest.fixture
+    def settings_without_key(self, monkeypatch):
+        self._start_process_with(monkeypatch, None)
+
+    def _open(self, tmp_db_path, key_log: list[str]) -> MetadataRegistry:
+        with patch(
+            "sec_semantic_search.database.metadata._get_sqlite_module",
+            side_effect=lambda key: _make_fake_sqlcipher_module(key_log) if key else sqlite3,
+        ):
+            return MetadataRegistry(db_path=tmp_db_path)
+
+    def test_later_env_key_does_not_switch_the_key(
+        self, settings_with_key, monkeypatch, tmp_db_path
+    ):
+        monkeypatch.setenv("DB_ENCRYPTION_KEY", "other-key")
+        key_log: list[str] = []
+        registry = self._open(tmp_db_path, key_log)
+        try:
+            expected = f"PRAGMA key = \"x'{b'settings-key'.hex()}'\""
+            # One PRAGMA per connection (write and read), both with the settings key.
+            assert key_log == [expected, expected]
+        finally:
+            registry.close()
+
+    def test_later_env_key_does_not_turn_encryption_on(
+        self, settings_without_key, monkeypatch, tmp_db_path
+    ):
+        monkeypatch.setenv("DB_ENCRYPTION_KEY", "late-key")
+        key_log: list[str] = []
+        registry = self._open(tmp_db_path, key_log)
+        try:
+            assert registry.encrypted is False
+            assert key_log == []
+        finally:
+            registry.close()
+
+    def test_later_key_file_is_not_read(self, settings_with_key, monkeypatch, tmp_db_path):
+        """Not even validated: the file is settings' business, read once at start-up."""
+        monkeypatch.delenv("DB_ENCRYPTION_KEY")
+        monkeypatch.setenv("DB_ENCRYPTION_KEY_FILE", "/nonexistent/db_encryption_key")
+        key_log: list[str] = []
+        registry = self._open(tmp_db_path, key_log)
+        try:
+            assert registry.encrypted is True
+            assert len(key_log) == 2
+        finally:
+            registry.close()
+
+    def test_explicit_key_still_wins(self, settings_with_key, tmp_db_path):
+        key_log: list[str] = []
+        with patch(
+            "sec_semantic_search.database.metadata._get_sqlite_module",
+            return_value=_make_fake_sqlcipher_module(key_log),
+        ):
+            registry = MetadataRegistry(db_path=tmp_db_path, encryption_key="injected")
+        try:
+            assert key_log == [f"PRAGMA key = \"x'{b'injected'.hex()}'\""] * 2
+        finally:
+            registry.close()
+
+    def test_registry_module_does_not_read_the_environment(self):
+        import inspect
+
+        import sec_semantic_search.database.metadata as metadata
+
+        source = inspect.getsource(metadata)
+        assert "os.environ" not in source
+        assert "DB_ENCRYPTION_KEY_FILE" not in source.replace("``DB_ENCRYPTION_KEY_FILE``", "")
