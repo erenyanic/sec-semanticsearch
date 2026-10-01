@@ -90,7 +90,8 @@ class Segment:
         segment_index: Zero-based position of this segment within the filing.
             Assigned by the parser and inherited by every chunk derived from
             this segment so the search layer can resolve the chunk back to
-            its parent context for display.
+            its parent context for display. ``None`` until assigned — never
+            ``0``, which is a real index (the filing's first segment).
 
     Example:
         >>> segment = Segment(
@@ -105,7 +106,7 @@ class Segment:
     content_type: ContentType
     content: str
     filing_id: FilingIdentifier
-    segment_index: int = field(default=0)
+    segment_index: int | None = field(default=None)
 
 
 @dataclass
@@ -123,6 +124,10 @@ class Chunk:
         content_type: Inherited content type from source segment
         filing_id: Reference to the source filing
         chunk_index: Zero-based index within the filing's chunks
+        segment_index: Index of the parent segment, copied from it by the
+            chunker. ``None`` when unknown: the chunk is then stored without
+            the key and shown without parent context, rather than with the
+            filing's first segment.
 
     The chunk_id property generates the ChromaDB document ID in the format:
         {TICKER}_{FORM_TYPE}_{DATE}_{INDEX}
@@ -134,7 +139,7 @@ class Chunk:
     filing_id: FilingIdentifier
     chunk_index: int = field(default=0)
     token_count: int = field(default=0)
-    segment_index: int = field(default=0)
+    segment_index: int | None = field(default=None)
 
     @property
     def chunk_id(self) -> str:
@@ -159,8 +164,9 @@ class Chunk:
             Dictionary suitable for ChromaDB metadata. Includes both
             ``filing_date`` (ISO string for display) and ``filing_date_int``
             (``YYYYMMDD`` integer for range queries with ``$gte``/``$lte``).
+            ``segment_index`` is present only when known.
         """
-        return {
+        metadata = {
             "path": self.path,
             "content_type": self.content_type.value,
             "ticker": self.filing_id.ticker,
@@ -168,8 +174,10 @@ class Chunk:
             "filing_date": self.filing_id.date_str,
             "filing_date_int": int(self.filing_id.date_str.replace("-", "")),
             "accession_number": self.filing_id.accession_number,
-            "segment_index": self.segment_index,
         }
+        if self.segment_index is not None:
+            metadata["segment_index"] = self.segment_index
+        return metadata
 
 
 @dataclass

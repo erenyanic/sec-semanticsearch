@@ -63,6 +63,24 @@ def _get_sqlite_module(encryption_key: str | None) -> types.ModuleType:
     return sqlite3
 
 
+def _check_segment_indices(segments: list[Segment]) -> None:
+    """Reject segments that cannot be stored under their own key.
+
+    Rows are keyed by ``(accession_number, segment_index)`` and written with
+    ``INSERT OR REPLACE``, so a missing or repeated index would drop or
+    overwrite another segment's text without an error.
+    """
+    indices = [s.segment_index for s in segments if s.segment_index is not None]
+    missing = len(segments) - len(indices)
+    repeated = len(indices) - len(set(indices))
+    if missing or repeated:
+        raise DatabaseError(
+            "Segments need unique segment_index values",
+            details="Segments are numbered by FilingParser.parse(); "
+            f"got {missing} without an index and {repeated} repeated.",
+        )
+
+
 # SEC accession number pattern: NNNNNNNNNN-NN-NNNNNN (with or without dashes).
 _ACCESSION_RE = re.compile(r"\b\d{10}-?\d{2}-?\d{6}\b")
 
@@ -472,6 +490,8 @@ class MetadataRegistry:
             VALUES (?, ?, ?, ?, ?, ?)
         """
         ingested_at = datetime.now(UTC).isoformat()
+        if segments:
+            _check_segment_indices(segments)
 
         try:
             with self._lock, self._conn:
@@ -543,6 +563,10 @@ class MetadataRegistry:
             VALUES (?, ?, ?, ?, ?, ?)
         """
         ingested_at = datetime.now(UTC).isoformat()
+        # Before the transaction: a NOT NULL failure inside it would be an
+        # IntegrityError, which this method reads as "already registered".
+        if segments:
+            _check_segment_indices(segments)
 
         try:
             with self._lock, self._conn:

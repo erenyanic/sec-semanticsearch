@@ -51,7 +51,8 @@ def sample_segments(sample_filing_id: FilingIdentifier) -> list[Segment]:
 
     Three segments are enough to exercise chunking, database storage,
     and search without being slow. Each has realistic but short content
-    so token counts are predictable.
+    so token counts are predictable. Indices are assigned as
+    ``FilingParser.parse()`` assigns them.
     """
     return [
         Segment(
@@ -63,18 +64,21 @@ def sample_segments(sample_filing_id: FilingIdentifier) -> list[Segment]:
                 "The Company sells its products worldwide through retail and online stores."
             ),
             filing_id=sample_filing_id,
+            segment_index=0,
         ),
         Segment(
             path="Part I > Item 1A > Risk Factors",
             content_type=ContentType.TEXTSMALL,
             content="See also the risk factors described in our annual report.",
             filing_id=sample_filing_id,
+            segment_index=1,
         ),
         Segment(
             path="Part II > Item 8 > Financial Statements",
             content_type=ContentType.TABLE,
             content="Revenue | 394,328 | 383,285\nNet Income | 93,736 | 96,995",
             filing_id=sample_filing_id,
+            segment_index=2,
         ),
     ]
 
@@ -99,6 +103,7 @@ def sample_chunks(sample_filing_id: FilingIdentifier) -> list[Chunk]:
             content_type=ContentType.TEXT,
             filing_id=sample_filing_id,
             chunk_index=0,
+            segment_index=0,
         ),
         Chunk(
             content="See also the risk factors described in our annual report.",
@@ -106,6 +111,7 @@ def sample_chunks(sample_filing_id: FilingIdentifier) -> list[Chunk]:
             content_type=ContentType.TEXTSMALL,
             filing_id=sample_filing_id,
             chunk_index=1,
+            segment_index=1,
         ),
         Chunk(
             content="Revenue | 394,328 | 383,285\nNet Income | 93,736 | 96,995",
@@ -113,6 +119,7 @@ def sample_chunks(sample_filing_id: FilingIdentifier) -> list[Chunk]:
             content_type=ContentType.TABLE,
             filing_id=sample_filing_id,
             chunk_index=2,
+            segment_index=2,
         ),
     ]
 

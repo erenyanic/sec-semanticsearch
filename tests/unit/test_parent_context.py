@@ -378,3 +378,133 @@ class TestParserSegmentIndex:
         segments = FilingParser().parse(sample_html, filing_id)
         # Indices must be 0..N-1 with no gaps and in extraction order.
         assert [s.segment_index for s in segments] == list(range(len(segments)))
+
+
+# ---------------------------------------------------------------------------
+# Unset segment_index (security audit 2026-09-16, observation)
+# ---------------------------------------------------------------------------
+
+
+class TestUnsetSegmentIndex:
+    """``0`` is a real index — the filing's first segment — so it cannot mean "unset".
+
+    With a default of ``0``, a chunk built outside ``TextChunker`` was shown
+    with the filing's first segment as its parent: wrong context, and no
+    highlight because the substring match failed.
+    """
+
+    def _chunk(self, filing_id, **kwargs) -> Chunk:
+        return Chunk(
+            content="Unrelated chunk text.",
+            path="Part II > Item 8",
+            content_type=ContentType.TEXT,
+            filing_id=filing_id,
+            **kwargs,
+        )
+
+    def test_defaults_are_none(self, filing_id):
+        segment = Segment(
+            path="Root", content_type=ContentType.TEXT, content="x", filing_id=filing_id
+        )
+        assert segment.segment_index is None
+        assert self._chunk(filing_id).segment_index is None
+
+    def test_unset_index_is_omitted_from_metadata(self, filing_id):
+        meta = self._chunk(filing_id).to_metadata()
+        assert "segment_index" not in meta
+        result = SearchResult.from_chromadb_result(document="x", metadata=meta, distance=0.1)
+        assert result.segment_index is None
+
+    def test_index_zero_is_kept(self, filing_id):
+        assert self._chunk(filing_id, segment_index=0).to_metadata()["segment_index"] == 0
+
+    def test_chunker_carries_an_unset_index_through(self, filing_id):
+        segment = Segment(
+            path="Root",
+            content_type=ContentType.TEXT,
+            content="One sentence only.",
+            filing_id=filing_id,
+        )
+        chunks = TextChunker(token_limit=20, tolerance=5, overlap=0).chunk_segment(segment)
+        assert [c.segment_index for c in chunks] == [None]
+
+    def test_unindexed_chunk_is_not_given_the_first_segment(
+        self, tmp_db_path, tmp_chroma_path, filing_id, long_segments
+    ):
+        """End to end through ChromaDB and the registry."""
+        import numpy as np
+
+        from sec_semantic_search.config import EMBEDDING_DIMENSION
+        from sec_semantic_search.database.client import ChromaDBClient
+        from sec_semantic_search.pipeline.orchestrator import ProcessedFiling
+
+        registry = MetadataRegistry(db_path=tmp_db_path)
+        registry.register_filing(filing_id, chunk_count=1, segments=long_segments)
+        chroma = ChromaDBClient(chroma_path=tmp_chroma_path)
+        vector = np.ones((1, EMBEDDING_DIMENSION), dtype=np.float32)
+        chroma.store_filing(
+            ProcessedFiling(
+                filing_id=filing_id,
+                chunks=[self._chunk(filing_id)],
+                embeddings=vector,
+                ingest_result=None,
+                segments=[],
+            )
+        )
+        embedder = MagicMock()
+        embedder.embed_query_for_chromadb.return_value = vector.tolist()
+
+        engine = SearchEngine(embedder=embedder, chroma_client=chroma, registry=registry)
+        (result,) = engine.search("anything")
+
+        assert result.segment_index is None
+        assert result.parent_content is None
+        assert result.parent_content != long_segments[0].content
+
+
+class TestRegistryRejectsUnkeyedSegments:
+    """Segments are stored with INSERT OR REPLACE on (accession, segment_index)."""
+
+    def _segments(self, filing_id, indices) -> list[Segment]:
+        return [
+            Segment(
+                path=f"Part {n}",
+                content_type=ContentType.TEXT,
+                content=f"Segment {n}.",
+                filing_id=filing_id,
+                segment_index=index,
+            )
+            for n, index in enumerate(indices)
+        ]
+
+    @pytest.mark.parametrize("indices", [[0, None], [None, None], [0, 1, 1]])
+    def test_register_filing_if_new_raises_instead_of_reporting_a_duplicate(
+        self, tmp_db_path, filing_id, indices
+    ):
+        """A NOT NULL failure inside the transaction would read as "already registered"."""
+        from sec_semantic_search.core import DatabaseError
+
+        registry = MetadataRegistry(db_path=tmp_db_path)
+        with pytest.raises(DatabaseError, match="unique segment_index"):
+            registry.register_filing_if_new(
+                filing_id, chunk_count=2, segments=self._segments(filing_id, indices)
+            )
+        assert registry.count() == 0
+        assert count_segments(registry) == 0
+
+    @pytest.mark.parametrize("indices", [[0, None], [2, 2]])
+    def test_register_filing_raises(self, tmp_db_path, filing_id, indices):
+        from sec_semantic_search.core import DatabaseError
+
+        registry = MetadataRegistry(db_path=tmp_db_path)
+        with pytest.raises(DatabaseError, match="unique segment_index"):
+            registry.register_filing(
+                filing_id, chunk_count=2, segments=self._segments(filing_id, indices)
+            )
+        assert registry.count() == 0
+
+    def test_parser_numbered_segments_are_stored(self, tmp_db_path, filing_id):
+        registry = MetadataRegistry(db_path=tmp_db_path)
+        segments = self._segments(filing_id, [0, 1, 2])
+        assert registry.register_filing_if_new(filing_id, chunk_count=3, segments=segments)
+        assert count_segments(registry, filing_id.accession_number) == 3
