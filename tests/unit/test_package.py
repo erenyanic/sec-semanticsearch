@@ -92,3 +92,33 @@ class TestAllExports:
         """Every name in __all__ should actually exist on the module."""
         for name in sec_semantic_search.__all__:
             assert hasattr(sec_semantic_search, name), f"{name!r} listed in __all__ but not found"
+
+
+class TestLicenceMetadata:
+    """Package metadata must state the licence in LICENSE (audit 2026-09-16).
+
+    pyproject.toml declared MIT while LICENSE and the README are Business
+    Source License 1.1, so any index reading the metadata misstated it.
+    """
+
+    @staticmethod
+    def _project() -> dict:
+        import tomllib
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[2]
+        return tomllib.loads((root / "pyproject.toml").read_text())["project"]
+
+    def test_licence_expression_matches_license_file(self):
+        from pathlib import Path
+
+        license_text = (Path(__file__).resolve().parents[2] / "LICENSE").read_text()
+        assert "Business Source License 1.1" in license_text
+        assert self._project()["license"] == "BUSL-1.1"
+
+    def test_license_file_is_shipped(self):
+        assert self._project()["license-files"] == ["LICENSE"]
+
+    def test_no_licence_classifier(self):
+        """PEP 639: the expression replaces classifiers; none may claim MIT or OSI."""
+        assert not [c for c in self._project()["classifiers"] if c.startswith("License ::")]
