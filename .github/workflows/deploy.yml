@@ -161,6 +161,12 @@ jobs:
       REGION: ${{ secrets.GCP_REGION }}
       REPO_NAME: sec-search
       TORCH_INDEX_URL: https://download.pytorch.org/whl/cu124
+      # Both builds run as this account, the only one that can read the
+      # Hugging Face token (gcloud-setup-secrets.sh). A build with a
+      # user-specified account must name its logging mode; with
+      # CLOUD_LOGGING_ONLY `gcloud builds submit` waits for the build and
+      # fails with it, and prints the log URL instead of streaming.
+      BUILD_SERVICE_ACCOUNT_NAME: sec-search-build
 
     outputs:
       api_image: ${{ steps.image-tags.outputs.api_image }}
@@ -210,6 +216,7 @@ jobs:
       # The Hugging Face token reaches `docker build` as a BuildKit
       # secret read from the step's environment (`env=HF_TOKEN`); it is
       # never expanded into the command line, a build arg or a layer.
+      # Only the build account (sec-search-build) can read the secret.
       # REQUIRE_BAKED_MODEL=1 fails the build if the secret is missing,
       # because the Cloud Run manifest runs with HF_HUB_OFFLINE=1.
       #
@@ -261,10 +268,12 @@ jobs:
             - ${_BUILD_CACHE}
           options:
             machineType: E2_HIGHCPU_8
+            logging: CLOUD_LOGGING_ONLY
           timeout: 3600s
           EOF
           gcloud builds submit \
             --project="${PROJECT_ID}" \
+            --service-account="projects/${PROJECT_ID}/serviceAccounts/${BUILD_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
             --config=/tmp/cloudbuild-api.yaml \
             --substitutions=_IMAGE="${API_IMAGE}",_BUILD_CACHE="${API_BUILD_CACHE}",_TORCH_INDEX_URL="${TORCH_INDEX_URL}" \
             .
@@ -295,10 +304,13 @@ jobs:
                 - .
           images:
             - ${_IMAGE}
+          options:
+            logging: CLOUD_LOGGING_ONLY
           timeout: 1800s
           EOF
           gcloud builds submit \
             --project="${PROJECT_ID}" \
+            --service-account="projects/${PROJECT_ID}/serviceAccounts/${BUILD_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
             --config=/tmp/cloudbuild-frontend.yaml \
             --substitutions=_IMAGE="${FRONTEND_IMAGE}" \
             .

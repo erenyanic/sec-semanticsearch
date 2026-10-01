@@ -30,6 +30,13 @@ REGION="${REGION:-us-central1}"
 REPO_NAME="sec-search"
 SERVICE_ACCOUNT_NAME="sec-search-sa"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+# The frontend service and Cloud Build each run as their own account, so
+# neither shares an identity (or its secrets) with the other or with the
+# Compute Engine default account.
+FRONTEND_SERVICE_ACCOUNT_NAME="sec-search-frontend"
+FRONTEND_SERVICE_ACCOUNT="${FRONTEND_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+BUILD_SERVICE_ACCOUNT_NAME="sec-search-build"
+BUILD_SERVICE_ACCOUNT="${BUILD_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/api:latest"
 FRONTEND_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/frontend:latest"
@@ -44,6 +51,21 @@ timestamp() {
 
 log() {
     echo "[$(timestamp)] $*"
+}
+
+ensure_service_account() {
+    local name="$1"
+    local display_name="$2"
+    local email="${name}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+    if gcloud iam service-accounts describe "$email" --project="$PROJECT_ID" > /dev/null 2>&1; then
+        log "Service account '$name' already exists."
+    else
+        log "Creating service account: $name"
+        gcloud iam service-accounts create "$name" \
+            --project="$PROJECT_ID" \
+            --display-name="$display_name"
+    fi
 }
 
 sed_replace() {
@@ -75,21 +97,19 @@ do_setup() {
         storage.googleapis.com \
         --project="$PROJECT_ID"
 
-    # Create service account.
-    if gcloud iam service-accounts describe "$SERVICE_ACCOUNT" --project="$PROJECT_ID" > /dev/null 2>&1; then
-        log "Service account '$SERVICE_ACCOUNT_NAME' already exists."
-    else
-        log "Creating service account: $SERVICE_ACCOUNT_NAME"
-        gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
-            --project="$PROJECT_ID" \
-            --display-name="SEC Semantic Search Service Account"
-    fi
+    # Create service accounts: the API's runtime identity, the frontend's,
+    # and the one Cloud Build runs as (deploy.yml).
+    ensure_service_account "$SERVICE_ACCOUNT_NAME" "SEC Semantic Search Service Account"
+    ensure_service_account "$FRONTEND_SERVICE_ACCOUNT_NAME" "SEC Semantic Search frontend"
+    ensure_service_account "$BUILD_SERVICE_ACCOUNT_NAME" "SEC Semantic Search Cloud Build"
 
-    # Grant IAM roles to the service account. No storage role: the API
-    # keeps its data on an in-memory volume, not in Cloud Storage.
+    # Grant IAM roles to the API service account. No storage role: the API
+    # keeps its data on an in-memory volume, not in Cloud Storage. No
+    # Secret Manager role either: gcloud-setup-secrets.sh grants access
+    # per secret, and project-wide access would include the build-time
+    # Hugging Face token.
     local roles=(
         "roles/run.invoker"
-        "roles/secretmanager.secretAccessor"
         "roles/logging.logWriter"
     )
     for role in "${roles[@]}"; do
@@ -99,6 +119,29 @@ do_setup() {
             --role="$role" \
             --quiet > /dev/null
     done
+
+    # Deployments set up before per-secret access hold it project-wide.
+    local api_roles
+    api_roles=$(gcloud projects get-iam-policy "$PROJECT_ID" \
+        --flatten="bindings[].members" \
+        --filter="bindings.members=\"serviceAccount:${SERVICE_ACCOUNT}\"" \
+        --format="value(bindings.role)")
+    if grep -qxF "roles/secretmanager.secretAccessor" <<< "$api_roles"; then
+        log "Removing project-wide roles/secretmanager.secretAccessor from ${SERVICE_ACCOUNT_NAME}..."
+        gcloud projects remove-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${SERVICE_ACCOUNT}" \
+            --role="roles/secretmanager.secretAccessor" \
+            --all \
+            --quiet > /dev/null
+    fi
+
+    # Cloud Build writes its logs to Cloud Logging (CLOUD_LOGGING_ONLY in
+    # deploy.yml). The frontend account needs no project role.
+    log "Granting roles/logging.logWriter to ${BUILD_SERVICE_ACCOUNT_NAME}..."
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${BUILD_SERVICE_ACCOUNT}" \
+        --role="roles/logging.logWriter" \
+        --quiet > /dev/null
 
     # Create Artifact Registry repository.
     if gcloud artifacts repositories describe "$REPO_NAME" \
@@ -112,6 +155,14 @@ do_setup() {
             --project="$PROJECT_ID" \
             --description="SEC Semantic Search container images"
     fi
+
+    # Cloud Build pushes the images and reads the layer cache back.
+    log "Granting roles/artifactregistry.writer on '$REPO_NAME' to ${BUILD_SERVICE_ACCOUNT_NAME}..."
+    gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
+        --location="$REGION" \
+        --project="$PROJECT_ID" \
+        --member="serviceAccount:${BUILD_SERVICE_ACCOUNT}" \
+        --role="roles/artifactregistry.writer" > /dev/null
 
     log "Infrastructure setup complete."
 }
@@ -271,7 +322,7 @@ do_teardown() {
     echo "  - Artifact Registry: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}"
     echo "  - Secrets: sec-search-db-encryption-key, sec-search-api-key, sec-search-admin-key, sec-search-hf-token"
     echo "  - Legacy data bucket, if created by an older version: gs://${PROJECT_ID}-sec-search-data"
-    echo "  - Service account: ${SERVICE_ACCOUNT}"
+    echo "  - Service accounts: ${SERVICE_ACCOUNT}, ${FRONTEND_SERVICE_ACCOUNT}, ${BUILD_SERVICE_ACCOUNT}"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────

@@ -10,7 +10,8 @@
 #   - gcloud CLI authenticated (gcloud auth login)
 #   - Project set (gcloud config set project PROJECT_ID)
 #   - Secret Manager API enabled
-#   - Service account created (sec-search-sa)
+#   - Service accounts created by ./scripts/gcloud-deploy.sh setup
+#     (sec-search-sa, sec-search-frontend, sec-search-build)
 #
 # The script creates four secrets:
 #   1. sec-search-db-encryption-key — SQLCipher encryption key
@@ -18,23 +19,27 @@
 #   3. sec-search-admin-key         — Admin-only destructive operations
 #   4. sec-search-hf-token          — Hugging Face read token (build time)
 #
-# The first three are granted to the runtime service account with the
-# secretmanager.secretAccessor role. The Hugging Face token is granted to
-# the Cloud Build service account only: it bakes the gated embedding model
-# into the API image, and the running service never needs it.
+# Each secret is granted (secretmanager.secretAccessor) to the accounts
+# that read it, and to no other:
+#   sec-search-sa        (API)       DB key, API key, admin key
+#   sec-search-frontend  (frontend)  admin key
+#   sec-search-build     (Cloud Build, deploy.yml)  Hugging Face token
+# The Hugging Face token bakes the gated embedding model into the API
+# image; neither running service can read it. Earlier versions granted it
+# to the Compute Engine default account, which the frontend ran as; that
+# grant is removed here.
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────
 PROJECT_ID="${PROJECT_ID:?Set PROJECT_ID environment variable}"
 SERVICE_ACCOUNT="sec-search-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+FRONTEND_SERVICE_ACCOUNT="sec-search-frontend@${PROJECT_ID}.iam.gserviceaccount.com"
 REGION="${REGION:-us-central1}"
 
-# Service account that runs `gcloud builds submit`. Projects whose first
-# build ran after mid-2024 use the Compute Engine default service account;
-# older projects use PROJECT_NUMBER@cloudbuild.gserviceaccount.com. Set
-# BUILD_SERVICE_ACCOUNT to override.
-BUILD_SERVICE_ACCOUNT="${BUILD_SERVICE_ACCOUNT:-}"
+# Service account Cloud Build runs as (`gcloud builds submit
+# --service-account` in deploy.yml). Set BUILD_SERVICE_ACCOUNT to override.
+BUILD_SERVICE_ACCOUNT="${BUILD_SERVICE_ACCOUNT:-sec-search-build@${PROJECT_ID}.iam.gserviceaccount.com}"
 
 # ── Helper functions ─────────────────────────────────────────────────
 timestamp() {
@@ -85,20 +90,38 @@ grant_access() {
         --quiet
 }
 
+revoke_access() {
+    local name="$1"
+    local member="$2"
+    local members
+
+    members=$(gcloud secrets get-iam-policy "$name" \
+        --project="$PROJECT_ID" \
+        --flatten="bindings[].members" \
+        --filter='bindings.role="roles/secretmanager.secretAccessor"' \
+        --format="value(bindings.members)")
+    if grep -qxF "serviceAccount:${member}" <<< "$members"; then
+        echo "[$(timestamp)] Revoking secretAccessor from ${member} for '$name'"
+        gcloud secrets remove-iam-policy-binding "$name" \
+            --project="$PROJECT_ID" \
+            --member="serviceAccount:${member}" \
+            --role="roles/secretmanager.secretAccessor" \
+            --quiet > /dev/null
+    fi
+}
+
 # ── Enable Secret Manager API ───────────────────────────────────────
 echo "[$(timestamp)] Ensuring Secret Manager API is enabled..."
 gcloud services enable secretmanager.googleapis.com --project="$PROJECT_ID"
 
-if [ -z "$BUILD_SERVICE_ACCOUNT" ]; then
-    PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
-    BUILD_SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-fi
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
 
 # ── Create secrets ───────────────────────────────────────────────────
 echo ""
 echo "=== SEC Semantic Search — Secret Manager Setup ==="
 echo "Project: $PROJECT_ID"
 echo "Service Account: $SERVICE_ACCOUNT"
+echo "Frontend Service Account: $FRONTEND_SERVICE_ACCOUNT"
 echo "Build Service Account: $BUILD_SERVICE_ACCOUNT"
 echo ""
 
@@ -107,14 +130,21 @@ create_secret "sec-search-api-key"           "API key for general access"
 create_secret "sec-search-admin-key"         "Admin key for destructive operations"
 create_secret "sec-search-hf-token"          "Hugging Face read token with access to the embedding model"
 
-# ── Grant access to service account ──────────────────────────────────
+# ── Grant access to service accounts ─────────────────────────────────
 echo ""
-echo "[$(timestamp)] Granting service account access to secrets..."
+echo "[$(timestamp)] Granting service accounts access to secrets..."
 grant_access "sec-search-db-encryption-key"
 grant_access "sec-search-api-key"
 grant_access "sec-search-admin-key"
-# Build-time only — deliberately not granted to the runtime service account.
+# The frontend's Next.js admin route handlers inject the admin key.
+grant_access "sec-search-admin-key" "$FRONTEND_SERVICE_ACCOUNT"
+# Build-time only — deliberately not granted to either service account.
 grant_access "sec-search-hf-token" "$BUILD_SERVICE_ACCOUNT"
+
+# Earlier versions granted the token to the default build accounts. The
+# Compute Engine default account also ran the frontend service.
+revoke_access "sec-search-hf-token" "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+revoke_access "sec-search-hf-token" "${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
 
 # ── Verify ───────────────────────────────────────────────────────────
 echo ""

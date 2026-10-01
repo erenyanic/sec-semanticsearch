@@ -450,18 +450,61 @@ class TestShellScripts:
 
 _GCLOUD_STUB = """#!/usr/bin/env bash
 # Records each call (arguments separated by 0x1f) and answers the reads
-# the script makes. Every other call succeeds without output.
+# the scripts make. Every other call succeeds without output.
 { printf '%s\\x1f' "$@"; printf '\\n'; } >> "$GCLOUD_LOG"
-case "$1 $2" in
-    "projects describe") echo 123456789; exit 0 ;;
-    "projects get-iam-policy") printf '%s\\n' ${STUB_DEPLOYER_ROLES:-}; exit 0 ;;
-    "storage buckets") [ "$3" = list ] && printf '%s\\n' ${STUB_BUCKETS:-}; exit 0 ;;
+case "$1 $2 $3" in
+    "projects describe "*) echo 123456789; exit 0 ;;
+    "projects get-iam-policy "*) printf '%s\\n' ${STUB_PROJECT_ROLES:-}; exit 0 ;;
+    "storage buckets list") printf '%s\\n' ${STUB_BUCKETS:-}; exit 0 ;;
+    "iam service-accounts get-iam-policy") printf '%s\\n' ${STUB_ACCOUNT_MEMBERS:-}; exit 0 ;;
+    "secrets get-iam-policy "*) printf '%s\\n' ${STUB_SECRET_MEMBERS:-}; exit 0 ;;
 esac
 for arg in "$@"; do
     [ "$arg" = describe ] && exit "${STUB_DESCRIBE_EXIT:-1}"
 done
 exit 0
 """
+
+
+def _run_with_stub_gcloud(
+    tmp_path: Path, argv: list[str], stdin: str = "", **env_overrides: str
+) -> tuple[subprocess.CompletedProcess, list[list[str]]]:
+    """Run a script with a recording stub ``gcloud`` first on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "gcloud"
+    stub.write_text(_GCLOUD_STUB)
+    stub.chmod(0o755)
+    log = tmp_path / "gcloud.log"
+    log.write_text("")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "GCLOUD_LOG": str(log),
+        "PROJECT_ID": "test-proj",
+        "REGION": "europe-west1",
+    }
+    env.update(env_overrides)
+    result = subprocess.run(
+        ["bash", *argv],
+        env=env,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=PROJECT_ROOT,
+    )
+    calls = [line.split("\x1f")[:-1] for line in log.read_text().splitlines()]
+    return result, calls
+
+
+def _calls(calls: list[list[str]], *prefix: str) -> list[list[str]]:
+    return [c for c in calls if c[: len(prefix)] == list(prefix)]
+
+
+def _flag(call: list[str], name: str) -> str:
+    values = [a.split("=", 1)[1] for a in call if a.startswith(f"{name}=")]
+    assert len(values) == 1, f"{name} not passed exactly once: {call}"
+    return values[0]
 
 
 class TestDeployerSetup:
@@ -476,37 +519,12 @@ class TestDeployerSetup:
     REPO = "Owner/Repo"
     DEPLOYER = "serviceAccount:sec-search-deployer@test-proj.iam.gserviceaccount.com"
 
-    def _run(self, tmp_path, **env_overrides) -> tuple[subprocess.CompletedProcess, list]:
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir(exist_ok=True)
-        stub = bin_dir / "gcloud"
-        stub.write_text(_GCLOUD_STUB)
-        stub.chmod(0o755)
-        log = tmp_path / "gcloud.log"
-        log.write_text("")
-        env = {
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "GCLOUD_LOG": str(log),
-            "PROJECT_ID": "test-proj",
-            "REGION": "europe-west1",
-            "GITHUB_REPOSITORY": self.REPO,
-        }
-        env.update(env_overrides)
-        result = subprocess.run(
-            ["bash", str(self.SCRIPT)], env=env, capture_output=True, text=True, timeout=30
-        )
-        calls = [line.split("\x1f")[:-1] for line in log.read_text().splitlines()]
-        return result, calls
+    def _run(self, tmp_path, **env_overrides):
+        env = {"GITHUB_REPOSITORY": self.REPO, **env_overrides}
+        return _run_with_stub_gcloud(tmp_path, [str(self.SCRIPT)], **env)
 
-    @staticmethod
-    def _calls(calls: list, *prefix: str) -> list[list[str]]:
-        return [c for c in calls if c[: len(prefix)] == list(prefix)]
-
-    @staticmethod
-    def _flag(call: list[str], name: str) -> str:
-        values = [a.split("=", 1)[1] for a in call if a.startswith(f"{name}=")]
-        assert len(values) == 1, f"{name} not passed exactly once: {call}"
-        return values[0]
+    _calls = staticmethod(_calls)
+    _flag = staticmethod(_flag)
 
     def test_succeeds_against_stub(self, tmp_path):
         result, _ = self._run(tmp_path)
@@ -575,7 +593,7 @@ class TestDeployerSetup:
     def test_removes_broad_roles_from_earlier_setups(self, tmp_path):
         _, calls = self._run(
             tmp_path,
-            STUB_DEPLOYER_ROLES="roles/storage.admin roles/secretmanager.admin "
+            STUB_PROJECT_ROLES="roles/storage.admin roles/secretmanager.admin "
             "roles/iam.serviceAccountUser roles/run.admin",
         )
         removed = {
@@ -592,12 +610,16 @@ class TestDeployerSetup:
             assert "--all" in call
 
     def test_nothing_removed_when_already_minimal(self, tmp_path):
-        _, calls = self._run(tmp_path, STUB_DEPLOYER_ROLES="roles/run.admin")
+        _, calls = self._run(tmp_path, STUB_PROJECT_ROLES="roles/run.admin")
         assert not self._calls(calls, "projects", "remove-iam-policy-binding")
 
     def test_storage_access_is_the_staging_bucket_only(self, tmp_path):
         _, calls = self._run(tmp_path)
-        (grant,) = self._calls(calls, "storage", "buckets", "add-iam-policy-binding")
+        (grant,) = [
+            c
+            for c in self._calls(calls, "storage", "buckets", "add-iam-policy-binding")
+            if f"--member={self.DEPLOYER}" in c
+        ]
         assert grant[3] == "gs://test-proj_cloudbuild"
         assert self._flag(grant, "--role") == "roles/storage.objectAdmin"
         assert self._flag(grant, "--member") == self.DEPLOYER
@@ -615,8 +637,8 @@ class TestDeployerSetup:
     def test_staging_bucket_name_matches_gcloud(self, tmp_path):
         """Same transformation as gcloud's GetDefaultStagingBucket()."""
         _, calls = self._run(tmp_path, PROJECT_ID="google.com:my-proj")
-        (grant,) = self._calls(calls, "storage", "buckets", "add-iam-policy-binding")
-        assert grant[3] == "gs://elgoog_com_my-proj_cloudbuild"
+        buckets = {c[3] for c in self._calls(calls, "storage", "buckets", "add-iam-policy-binding")}
+        assert buckets == {"gs://elgoog_com_my-proj_cloudbuild"}
 
     def test_artifact_registry_access_is_the_repository_only(self, tmp_path):
         _, calls = self._run(tmp_path)
@@ -625,14 +647,44 @@ class TestDeployerSetup:
         assert self._flag(grant, "--role") == "roles/artifactregistry.writer"
         assert self._flag(grant, "--location") == "europe-west1"
 
-    def test_act_as_is_granted_per_account(self, tmp_path):
+    def test_act_as_only_the_dedicated_accounts(self, tmp_path):
+        """Never the Compute Engine default account, which holds project Editor."""
         _, calls = self._run(tmp_path)
-        act_as = [
+        act_as = {
             c[3]
             for c in self._calls(calls, "iam", "service-accounts", "add-iam-policy-binding")
             if "--role=roles/iam.serviceAccountUser" in c
-        ]
-        assert "sec-search-sa@test-proj.iam.gserviceaccount.com" in act_as
+        }
+        assert act_as == {
+            "sec-search-sa@test-proj.iam.gserviceaccount.com",
+            "sec-search-frontend@test-proj.iam.gserviceaccount.com",
+            "sec-search-build@test-proj.iam.gserviceaccount.com",
+        }
+
+    def test_removes_act_as_on_compute_default_account(self, tmp_path):
+        _, calls = self._run(tmp_path, STUB_ACCOUNT_MEMBERS=self.DEPLOYER)
+        (removal,) = self._calls(calls, "iam", "service-accounts", "remove-iam-policy-binding")
+        assert removal[3] == "123456789-compute@developer.gserviceaccount.com"
+        assert self._flag(removal, "--member") == self.DEPLOYER
+        assert self._flag(removal, "--role") == "roles/iam.serviceAccountUser"
+
+    def test_no_compute_removal_when_not_bound(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        assert not self._calls(calls, "iam", "service-accounts", "remove-iam-policy-binding")
+
+    def test_build_account_reads_staged_source(self, tmp_path):
+        _, calls = self._run(tmp_path)
+        grants = {
+            (_flag(c, "--member"), _flag(c, "--role"))
+            for c in self._calls(calls, "storage", "buckets", "add-iam-policy-binding")
+        }
+        assert grants == {
+            (self.DEPLOYER, "roles/storage.objectAdmin"),
+            (
+                "serviceAccount:sec-search-build@test-proj.iam.gserviceaccount.com",
+                "roles/storage.objectViewer",
+            ),
+        }
 
     def test_prints_repository_secret_values(self, tmp_path):
         result, _ = self._run(tmp_path)
@@ -643,3 +695,127 @@ class TestDeployerSetup:
         assert (
             "GCP_SERVICE_ACCOUNT            = sec-search-deployer@test-proj.iam.gserviceaccount.com"
         ) in result.stdout
+
+
+class TestServiceIdentities:
+    """Each service and the build run as their own account (audit 2026-09-28).
+
+    The frontend ran as the Compute Engine default account, which also held
+    the build-time Hugging Face token, and the API's account could read every
+    secret in the project.
+    """
+
+    API = "serviceAccount:sec-search-sa@test-proj.iam.gserviceaccount.com"
+    FRONTEND = "sec-search-frontend@test-proj.iam.gserviceaccount.com"
+    BUILD = "sec-search-build@test-proj.iam.gserviceaccount.com"
+
+    def _setup(self, tmp_path, **env):
+        return _run_with_stub_gcloud(tmp_path, ["scripts/gcloud-deploy.sh", "setup"], **env)
+
+    def test_frontend_runs_as_its_own_account(self, frontend_service, api_service):
+        frontend_sa = frontend_service["spec"]["template"]["spec"]["serviceAccountName"]
+        api_sa = api_service["spec"]["template"]["spec"]["serviceAccountName"]
+        assert frontend_sa == "sec-search-frontend@PROJECT_ID.iam.gserviceaccount.com"
+        assert frontend_sa != api_sa
+
+    def test_setup_succeeds_against_stub(self, tmp_path):
+        result, _ = self._setup(tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_setup_creates_the_three_accounts(self, tmp_path):
+        _, calls = self._setup(tmp_path)
+        created = {c[3] for c in _calls(calls, "iam", "service-accounts", "create")}
+        assert created == {"sec-search-sa", "sec-search-frontend", "sec-search-build"}
+
+    def test_api_account_has_no_project_wide_secret_access(self, tmp_path):
+        _, calls = self._setup(tmp_path)
+        api_roles = {
+            _flag(c, "--role")
+            for c in _calls(calls, "projects", "add-iam-policy-binding")
+            if _flag(c, "--member") == self.API
+        }
+        assert api_roles == {"roles/run.invoker", "roles/logging.logWriter"}
+
+    def test_setup_removes_project_wide_secret_access(self, tmp_path):
+        _, calls = self._setup(
+            tmp_path, STUB_PROJECT_ROLES="roles/run.invoker roles/secretmanager.secretAccessor"
+        )
+        (removal,) = _calls(calls, "projects", "remove-iam-policy-binding")
+        assert _flag(removal, "--member") == self.API
+        assert _flag(removal, "--role") == "roles/secretmanager.secretAccessor"
+
+    def test_frontend_account_has_no_project_role(self, tmp_path):
+        _, calls = self._setup(tmp_path)
+        members = {
+            _flag(c, "--member") for c in _calls(calls, "projects", "add-iam-policy-binding")
+        }
+        assert f"serviceAccount:{self.FRONTEND}" not in members
+
+    def test_build_account_roles(self, tmp_path):
+        _, calls = self._setup(tmp_path)
+        project = {
+            _flag(c, "--role")
+            for c in _calls(calls, "projects", "add-iam-policy-binding")
+            if _flag(c, "--member") == f"serviceAccount:{self.BUILD}"
+        }
+        assert project == {"roles/logging.logWriter"}
+        (repo,) = _calls(calls, "artifacts", "repositories", "add-iam-policy-binding")
+        assert repo[3] == "sec-search"
+        assert _flag(repo, "--member") == f"serviceAccount:{self.BUILD}"
+        assert _flag(repo, "--role") == "roles/artifactregistry.writer"
+
+
+class TestSecretGrants:
+    """gcloud-setup-secrets.sh grants each secret to its readers only."""
+
+    def _secrets(self, tmp_path, **env):
+        # Four empty answers: create the secrets, add no versions.
+        return _run_with_stub_gcloud(
+            tmp_path, ["scripts/gcloud-setup-secrets.sh"], stdin="\n" * 4, **env
+        )
+
+    def _grants(self, calls) -> dict[str, set[str]]:
+        grants: dict[str, set[str]] = {}
+        for c in _calls(calls, "secrets", "add-iam-policy-binding"):
+            assert _flag(c, "--role") == "roles/secretmanager.secretAccessor"
+            grants.setdefault(c[2], set()).add(_flag(c, "--member").removeprefix("serviceAccount:"))
+        return grants
+
+    def test_succeeds_against_stub(self, tmp_path):
+        result, _ = self._secrets(tmp_path)
+        assert result.returncode == 0, result.stderr
+
+    def test_each_secret_reaches_its_readers_only(self, tmp_path):
+        _, calls = self._secrets(tmp_path)
+        api = "sec-search-sa@test-proj.iam.gserviceaccount.com"
+        assert self._grants(calls) == {
+            "sec-search-db-encryption-key": {api},
+            "sec-search-api-key": {api},
+            "sec-search-admin-key": {api, "sec-search-frontend@test-proj.iam.gserviceaccount.com"},
+            "sec-search-hf-token": {"sec-search-build@test-proj.iam.gserviceaccount.com"},
+        }
+
+    def test_build_account_override(self, tmp_path):
+        _, calls = self._secrets(
+            tmp_path, BUILD_SERVICE_ACCOUNT="custom-build@test-proj.iam.gserviceaccount.com"
+        )
+        assert self._grants(calls)["sec-search-hf-token"] == {
+            "custom-build@test-proj.iam.gserviceaccount.com"
+        }
+
+    def test_revokes_token_from_default_build_accounts(self, tmp_path):
+        _, calls = self._secrets(
+            tmp_path,
+            STUB_SECRET_MEMBERS="serviceAccount:123456789-compute@developer.gserviceaccount.com "
+            "serviceAccount:123456789@cloudbuild.gserviceaccount.com",
+        )
+        removals = _calls(calls, "secrets", "remove-iam-policy-binding")
+        assert {c[2] for c in removals} == {"sec-search-hf-token"}
+        assert {_flag(c, "--member") for c in removals} == {
+            "serviceAccount:123456789-compute@developer.gserviceaccount.com",
+            "serviceAccount:123456789@cloudbuild.gserviceaccount.com",
+        }
+
+    def test_nothing_revoked_when_not_bound(self, tmp_path):
+        _, calls = self._secrets(tmp_path)
+        assert not _calls(calls, "secrets", "remove-iam-policy-binding")

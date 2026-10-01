@@ -17,8 +17,8 @@
 #
 # Prerequisites:
 #   - gcloud CLI authenticated as a project owner (gcloud auth login)
-#   - ./scripts/gcloud-deploy.sh setup has run (runtime service account
-#     and Artifact Registry repository exist)
+#   - ./scripts/gcloud-deploy.sh setup has run (service accounts and
+#     Artifact Registry repository exist)
 #
 # Idempotent: re-running re-applies the provider condition and removes
 # the broad project roles that earlier hand-made setups granted.
@@ -37,7 +37,12 @@
 #                                                        staging bucket belongs to the project)
 #   bucket      roles/storage.objectAdmin                gs://PROJECT_cloudbuild — build source upload
 #   repository  roles/artifactregistry.writer            sec-search images — tag pushed images
-#   account     roles/iam.serviceAccountUser             only the accounts the services and builds run as
+#   account     roles/iam.serviceAccountUser             sec-search-sa, sec-search-frontend and
+#                                                        sec-search-build only — never the Compute
+#                                                        Engine default account (project Editor)
+#
+# The build account (sec-search-build) gets roles/storage.objectViewer on
+# the staging bucket to read the uploaded source.
 #
 # No Secret Manager role: secrets are created by gcloud-setup-secrets.sh,
 # and each service reads its own secrets under its own identity.
@@ -56,6 +61,8 @@ PROVIDER_ID="${WIF_PROVIDER_ID:-sec-search-deploy}"
 DEPLOYER_NAME="${DEPLOYER_NAME:-sec-search-deployer}"
 DEPLOYER_SA="${DEPLOYER_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 RUNTIME_SA="sec-search-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+FRONTEND_SA="sec-search-frontend@${PROJECT_ID}.iam.gserviceaccount.com"
+BUILD_SA="sec-search-build@${PROJECT_ID}.iam.gserviceaccount.com"
 REPO_NAME="sec-search"
 
 # The repository name is written into a CEL expression below; anything
@@ -109,12 +116,12 @@ STAGING_BUCKET="${PROJECT_ID//:/_}"
 STAGING_BUCKET="${STAGING_BUCKET//./_}"
 STAGING_BUCKET="${STAGING_BUCKET//google/elgoog}_cloudbuild"
 
-# Accounts the deployer may act as: the API runs as the runtime account;
-# the frontend service and Cloud Build run as the Compute Engine default
-# account.
+# Accounts the deployer may act as: the two services and Cloud Build
+# (deploy.yml passes --service-account).
 ACT_AS_ACCOUNTS=(
     "$RUNTIME_SA"
-    "$COMPUTE_SA"
+    "$FRONTEND_SA"
+    "$BUILD_SA"
 )
 
 echo ""
@@ -228,6 +235,11 @@ gcloud storage buckets add-iam-policy-binding "gs://${STAGING_BUCKET}" \
     --member="serviceAccount:${DEPLOYER_SA}" \
     --role="roles/storage.objectAdmin" > /dev/null
 
+log "Granting roles/storage.objectViewer on gs://${STAGING_BUCKET} to the build account..."
+gcloud storage buckets add-iam-policy-binding "gs://${STAGING_BUCKET}" \
+    --member="serviceAccount:${BUILD_SA}" \
+    --role="roles/storage.objectViewer" > /dev/null
+
 log "Granting roles/artifactregistry.writer on repository '$REPO_NAME'..."
 gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
     --project="$PROJECT_ID" \
@@ -243,6 +255,22 @@ for account in "${ACT_AS_ACCOUNTS[@]}"; do
         --role="roles/iam.serviceAccountUser" \
         --quiet > /dev/null
 done
+
+# The frontend and the builds used to run as the Compute Engine default
+# account, so earlier setups let the deployer act as it.
+compute_users=$(gcloud iam service-accounts get-iam-policy "$COMPUTE_SA" \
+    --project="$PROJECT_ID" \
+    --flatten="bindings[].members" \
+    --filter='bindings.role="roles/iam.serviceAccountUser"' \
+    --format="value(bindings.members)")
+if grep -qxF "serviceAccount:${DEPLOYER_SA}" <<< "$compute_users"; then
+    log "Removing roles/iam.serviceAccountUser on ${COMPUTE_SA}..."
+    gcloud iam service-accounts remove-iam-policy-binding "$COMPUTE_SA" \
+        --project="$PROJECT_ID" \
+        --member="serviceAccount:${DEPLOYER_SA}" \
+        --role="roles/iam.serviceAccountUser" \
+        --quiet > /dev/null
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""

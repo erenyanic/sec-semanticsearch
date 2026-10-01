@@ -39,6 +39,11 @@ spec:
       containerConcurrency: 80
       timeoutSeconds: 300
 
+      # Own identity, granted sec-search-admin-key only. Without it the
+      # service runs as the Compute Engine default account, which Cloud
+      # Build may also use and which could then read build-time secrets.
+      serviceAccountName: sec-search-frontend@PROJECT_ID.iam.gserviceaccount.com
+
       containers:
         - image: REGION-docker.pkg.dev/PROJECT_ID/sec-search/frontend:latest
           name: frontend

@@ -487,6 +487,26 @@ class TestDeployWorkflowJobs:
         env = build.get("env", {})
         assert env.get("TORCH_INDEX_URL") == "https://download.pytorch.org/whl/cu124"
 
+    def test_builds_run_as_the_build_account(self, deploy_workflow):
+        """Only sec-search-build can read the Hugging Face token (audit 2026-09-28).
+
+        Without --service-account, Cloud Build runs as the Compute Engine
+        default account, which the frontend service used to run as too.
+        """
+        build = deploy_workflow["jobs"]["build"]
+        assert build["env"]["BUILD_SERVICE_ACCOUNT_NAME"] == "sec-search-build"
+        submits = [
+            run for run in _collect_run_blocks({"jobs": {"build": build}}) if "builds submit" in run
+        ]
+        assert len(submits) == 2
+        for run in submits:
+            assert (
+                '--service-account="projects/${PROJECT_ID}/serviceAccounts/'
+                '${BUILD_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"'
+            ) in run
+            # A user-specified build account requires an explicit logging mode.
+            assert "logging: CLOUD_LOGGING_ONLY" in run
+
     def test_deploy_reuses_gcloud_deploy_script(self, deploy_workflow):
         """Single source of truth: reuse scripts/gcloud-deploy.sh."""
         runs = _collect_run_blocks(deploy_workflow)
