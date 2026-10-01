@@ -6,6 +6,7 @@ configuration alignment between service definitions. These tests run
 without a GCP account — they only check the files themselves.
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -535,17 +536,48 @@ class TestDeployerSetup:
         (create,) = self._calls(calls, "iam", "workload-identity-pools", "providers", "create-oidc")
         assert self._flag(create, "--attribute-condition") == (
             "assertion.repository == 'Owner/Repo' && "
-            "assertion.workflow_ref.startsWith("
-            "'Owner/Repo/.github/workflows/deploy.yml@refs/tags/v')"
+            "assertion.ref_type == 'tag' && "
+            "assertion.ref.matches('^refs/tags/v[^/]+$') && "
+            "assertion.workflow_ref == 'Owner/Repo/.github/workflows/deploy.yml@' + assertion.ref"
         )
         assert self._flag(create, "--issuer-uri") == "https://token.actions.githubusercontent.com"
+
+    def test_condition_rejects_tags_with_a_slash(self, tmp_path):
+        """Security review 2026-10-01: a prefix match accepted "refs/tags/vx/evil".
+
+        The tag ruleset's "refs/tags/v*" does not cover it (fnmatch "*" stops
+        at "/"), so any writer could push it with a rewritten deploy.yml.
+        """
+        _, calls = self._run(tmp_path)
+        (create,) = self._calls(calls, "iam", "workload-identity-pools", "providers", "create-oidc")
+        condition = self._flag(create, "--attribute-condition")
+        assert "startsWith" not in condition
+        (ref_regex,) = re.findall(r"assertion\.ref\.matches\('([^']+)'\)", condition)
+        for ref in ["refs/tags/v1", "refs/tags/v1.2.3", "refs/tags/v0.2.0-rc1"]:
+            assert re.search(ref_regex, ref), ref
+        for ref in ["refs/tags/vx/evil", "refs/tags/v1/a/b", "refs/tags/v", "refs/heads/v1"]:
+            assert not re.search(ref_regex, ref), ref
+
+    def test_repository_id_pins_the_condition(self, tmp_path):
+        _, calls = self._run(tmp_path, GITHUB_REPOSITORY_ID="4242")
+        (create,) = self._calls(calls, "iam", "workload-identity-pools", "providers", "create-oidc")
+        assert self._flag(create, "--attribute-condition").startswith(
+            "assertion.repository_id == '4242' && assertion.repository == 'Owner/Repo' && "
+        )
+
+    def test_rejects_non_numeric_repository_id(self, tmp_path):
+        result, calls = self._run(tmp_path, GITHUB_REPOSITORY_ID="42' || true || '")
+        assert result.returncode != 0
+        assert calls == []
 
     def test_existing_provider_gets_the_condition(self, tmp_path):
         """Re-running on an older, unconditioned provider must apply the condition."""
         _, calls = self._run(tmp_path, STUB_DESCRIBE_EXIT="0")
         assert not self._calls(calls, "iam", "workload-identity-pools", "providers", "create-oidc")
         (update,) = self._calls(calls, "iam", "workload-identity-pools", "providers", "update-oidc")
-        assert "deploy.yml@refs/tags/v" in self._flag(update, "--attribute-condition")
+        assert "assertion.ref.matches('^refs/tags/v[^/]+$')" in self._flag(
+            update, "--attribute-condition"
+        )
 
     @pytest.mark.parametrize(
         "repository",

@@ -14,6 +14,9 @@
 #   WIF_POOL_ID       Workload Identity pool    (default: github)
 #   WIF_PROVIDER_ID   OIDC provider in the pool (default: sec-search-deploy)
 #   DEPLOYER_NAME     deployer account name     (default: sec-search-deployer)
+#   GITHUB_REPOSITORY_ID  numeric repository id (gh api repos/OWNER/REPO --jq .id);
+#                     when set, a repository later created under the same
+#                     name is rejected too
 #
 # Prerequisites:
 #   - gcloud CLI authenticated as a project owner (gcloud auth login)
@@ -24,10 +27,14 @@
 # the broad project roles that earlier hand-made setups granted.
 #
 # Token exchange. The OIDC provider accepts a GitHub token only when it
-# was issued to deploy.yml running at a v* tag of GITHUB_REPOSITORY. A
-# token minted by any other workflow, branch, pull request or fork of the
-# repository is rejected by Google before the deployer can be
-# impersonated.
+# was issued to deploy.yml running at a v* tag of GITHUB_REPOSITORY whose
+# name has no '/'. A token minted by any other workflow, branch, pull
+# request or fork of the repository is rejected by Google before the
+# deployer can be impersonated. Those are exactly the tags that
+# github-protect-deploy.sh lets only admins create: rulesets match with
+# fnmatch, where '*' stops at '/', so a prefix match on "refs/tags/v"
+# would also accept a tag like "vx/evil" that any writer could push with
+# a rewritten deploy.yml.
 #
 # Deployer roles (nothing else):
 #   project     roles/run.admin                          deploy services, set invoker policy
@@ -60,6 +67,7 @@ POOL_ID="${WIF_POOL_ID:-github}"
 PROVIDER_ID="${WIF_PROVIDER_ID:-sec-search-deploy}"
 DEPLOYER_NAME="${DEPLOYER_NAME:-sec-search-deployer}"
 DEPLOYER_SA="${DEPLOYER_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+GITHUB_REPOSITORY_ID="${GITHUB_REPOSITORY_ID:-}"
 RUNTIME_SA="sec-search-sa@${PROJECT_ID}.iam.gserviceaccount.com"
 FRONTEND_SA="sec-search-frontend@${PROJECT_ID}.iam.gserviceaccount.com"
 BUILD_SA="sec-search-build@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -71,12 +79,19 @@ if [[ ! "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]]; then
     echo "GITHUB_REPOSITORY must be owner/repo (got: ${GITHUB_REPOSITORY})" >&2
     exit 1
 fi
+if [[ -n "$GITHUB_REPOSITORY_ID" && ! "$GITHUB_REPOSITORY_ID" =~ ^[0-9]+$ ]]; then
+    echo "GITHUB_REPOSITORY_ID must be numeric (got: ${GITHUB_REPOSITORY_ID})" >&2
+    exit 1
+fi
 
 # GitHub OIDC claims compare case-sensitively. workflow_ref is
 # "owner/repo/.github/workflows/deploy.yml@refs/tags/v1.2.3" for a tag
 # push and for a manual run dispatched from a tag.
 ATTRIBUTE_MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref,attribute.workflow_ref=assertion.workflow_ref"
-ATTRIBUTE_CONDITION="assertion.repository == '${GITHUB_REPOSITORY}' && assertion.workflow_ref.startsWith('${GITHUB_REPOSITORY}/.github/workflows/deploy.yml@refs/tags/v')"
+ATTRIBUTE_CONDITION="assertion.repository == '${GITHUB_REPOSITORY}' && assertion.ref_type == 'tag' && assertion.ref.matches('^refs/tags/v[^/]+\$') && assertion.workflow_ref == '${GITHUB_REPOSITORY}/.github/workflows/deploy.yml@' + assertion.ref"
+if [ -n "$GITHUB_REPOSITORY_ID" ]; then
+    ATTRIBUTE_CONDITION="assertion.repository_id == '${GITHUB_REPOSITORY_ID}' && ${ATTRIBUTE_CONDITION}"
+fi
 
 # Project roles the deployer must not hold. Earlier setups granted the
 # first two outright and the others project-wide instead of per resource.

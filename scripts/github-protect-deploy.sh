@@ -15,7 +15,8 @@
 # re-applies on every run:
 #
 #   1. Tag ruleset "Release tags (v*)": only repository admins may create,
-#      move or delete v* tags.
+#      move or delete tags starting with v, including names with '/'
+#      (rulesets match with fnmatch, where '*' stops at '/').
 #   2. Environment `production`: deployments from v* tags only, each one
 #      waiting for a DEPLOY_REVIEWERS approval that admins cannot bypass.
 #
@@ -83,7 +84,7 @@ ruleset_json=$(cat <<EOF
   "bypass_actors": [
     {"actor_id": ${ADMIN_ROLE_ID}, "actor_type": "RepositoryRole", "bypass_mode": "always"}
   ],
-  "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+  "conditions": {"ref_name": {"include": ["refs/tags/v*", "refs/tags/v*/**/*"], "exclude": []}},
   "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}]
 }
 EOF

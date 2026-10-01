@@ -9,15 +9,16 @@
 #   2. `push` of a `v*` tag  — tagged releases deploy automatically
 #        (e.g. `git tag v0.2.0 && git push origin v0.2.0`).
 #
-# Google credentials are issued only to this workflow running at a v* tag:
-# the Workload Identity provider created by scripts/gcloud-setup-deployer.sh
-# rejects every other workflow file and ref. Run a manual deploy against a
+# Google credentials are issued only to this workflow running at a v* tag
+# without '/' in its name: the Workload Identity provider created by
+# scripts/gcloud-setup-deployer.sh rejects every other workflow file and
+# ref. Renaming this file breaks Google authentication. Run a manual deploy against a
 # tag ("Use workflow from" → Tags); dispatched from a branch it fails at
 # the first Google authentication step.
 #
 # Nothing skips the CI gate. Who may deploy is set in GitHub, not here:
 # scripts/github-protect-deploy.sh restricts creating, moving and deleting
-# v* tags to repository admins, and makes the `production` environment
+# every tag starting with v to repository admins, and makes the `production` environment
 # accept v* tags only and wait for a required reviewer.
 #
 # The workflow:

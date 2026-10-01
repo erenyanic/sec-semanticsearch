@@ -761,11 +761,41 @@ class TestDeployProtectionScript:
         ruleset = self._write(writes, "POST", "repos/Owner/Repo/rulesets")
         assert ruleset["target"] == "tag"
         assert ruleset["enforcement"] == "active"
-        assert ruleset["conditions"]["ref_name"]["include"] == ["refs/tags/v*"]
+        assert ruleset["conditions"]["ref_name"]["include"] == [
+            "refs/tags/v*",
+            "refs/tags/v*/**/*",
+        ]
         assert {r["type"] for r in ruleset["rules"]} == {"creation", "update", "deletion"}
         assert ruleset["bypass_actors"] == [
             {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
         ]
+
+    def test_ruleset_covers_every_tag_the_wif_condition_accepts(self, tmp_path):
+        """Only admins may create a tag that can obtain Google credentials.
+
+        Security review 2026-10-01: rulesets match with Ruby's File.fnmatch and
+        FNM_PATHNAME ("*" stops at "/"), so "refs/tags/v*" left "refs/tags/vx/evil"
+        to any writer while the provider accepted it.
+        """
+        deployer = (PROJECT_ROOT / "scripts" / "gcloud-setup-deployer.sh").read_text()
+        (ref_regex,) = re.findall(r"assertion\.ref\.matches\('([^']+)'\)", deployer)
+        ref_regex = ref_regex.replace("\\$", "$")
+        _, _, writes = self._run(tmp_path)
+        ruleset = self._write(writes, "POST", "repos/Owner/Repo/rulesets")
+        patterns = ruleset["conditions"]["ref_name"]["include"]
+
+        def fnmatch_pathname(pattern: str, ref: str) -> bool:
+            rx = re.escape(pattern).replace(r"\*\*/", "(?:[^/]+/)*").replace(r"\*", "[^/]*")
+            return re.fullmatch(rx, ref) is not None
+
+        tags = ["v1", "v1.2.3", "v0.2.0-rc1", "vx/evil", "v1/a/b", "v", "x1", "release/v1"]
+        for tag in tags:
+            ref = f"refs/tags/{tag}"
+            admin_only = any(fnmatch_pathname(p, ref) for p in patterns)
+            if re.search(ref_regex, ref):
+                assert admin_only, f"{ref} gets credentials but is not admin-only"
+            if tag.startswith("v"):
+                assert admin_only, f"{ref} starts with v but is not admin-only"
 
     def test_existing_ruleset_is_updated_in_place(self, tmp_path):
         _, calls, writes = self._run(tmp_path, STUB_RULESET_ID="77")
