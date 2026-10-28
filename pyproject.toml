@@ -27,7 +27,7 @@ dependencies = [
     "edgartools==5.25.1",
 
     # HTML parsing
-    "doc2dict==0.7.1",
+    "doc2dict==0.7.3",
 
     # Embeddings and ML
     "sentence-transformers==5.2.2",
